@@ -3739,8 +3739,18 @@ std::vector<std::string> getLinesFromDataFile(std::string filename)
 	return lines;
 }
 
+// MYMOD: weak fallback so the editor target (which does not link consolecommand.cpp)
+// still builds. The game binary provides the real definition, which wins at link time.
+__attribute__((weak)) void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor) {}
+
 int physfsLoadMapFile(int levelToLoad, Uint32 seed, bool useRandSeed, int* checkMapHash)
 {
+	printlog("[MYMOD] loading floor / level %d\n", levelToLoad);
+	// MYMOD: a fresh run starts at level 1 -> wipe follower relationships + the Herx secret.
+	if ( levelToLoad <= 1 )
+	{
+		mymod_recordEvent("new_run", 0, 0, 0);
+	}
 	std::string mapsDirectory; // store the full file path here.
 	std::string line = "";
 	if ( loadCustomNextMap.compare("") != 0 )

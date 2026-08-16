@@ -2169,6 +2169,11 @@ bool makeFollower(int monsterclicked, bool ringconflict, char namesays[64],
 	my->monsterState = MONSTER_STATE_WAIT; // be ready to follow
 	myStats->leader_uid = players[monsterclicked]->entity->getUID();
 	my->monsterAllyIndex = monsterclicked;
+	// MYMOD: record recruitment as a remembered event (interact-recruit path).
+	{
+		extern void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor);
+		mymod_recordEvent("recruitment", my->getUID(), (int)my->getRace(), currentlevel);
+	}
 	if ( myStats->monsterForceAllegiance == Stat::MONSTER_FORCE_PLAYER_ENEMY )
 	{
 		myStats->monsterForceAllegiance = Stat::MONSTER_FORCE_ALLEGIANCE_NONE;
@@ -11184,6 +11189,11 @@ bool forceFollower(Entity& leader, Entity& follower)
 	follower.monsterTarget = 0;
 	follower.monsterAllyIndex = -1;
 	followerStats->leader_uid = leader.getUID();
+	// MYMOD: record recruitment as a remembered event (player leaders only).
+	extern void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor);
+	if ( leader.behavior == &actPlayer ) {
+		mymod_recordEvent("recruitment", follower.getUID(), (int)follower.getRace(), currentlevel);
+	}
 
 	for ( node_t* node = leaderStats->FOLLOWERS.first; node != nullptr; node = node->next )
 	{
@@ -12434,6 +12444,7 @@ bool Entity::monsterHasLeader()
 
 void Entity::monsterAllySendCommand(int command, int destX, int destY, Uint32 uid)
 {
+	if ( Entity* _tgt = uidToEntity(uid) ) { printlog("[MYMOD] ally command %d sent to race %d\n", command, (int)_tgt->getRace()); } else { printlog("[MYMOD] ally command %d sent (no target uid)\n", command); }
 	if ( multiplayer == CLIENT )
 	{
 		return;

@@ -938,6 +938,8 @@ static real_t drunkextend[MAXPLAYERS] = { (real_t)0.0 };
 
 void gameLogic(void)
 {
+	extern void mymod_pollAI();
+	mymod_pollAI();
 	Uint32 x;
 	node_t* node, *nextnode, *node2;
 	Entity* entity;

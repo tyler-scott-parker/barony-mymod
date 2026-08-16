@@ -91,6 +91,32 @@ void initLich(Entity* my, Stat* myStats)
 			int defaultItems = countDefaultItems(myStats);
 
 			my->setHardcoreStats(*myStats);
+			// MYMOD: Herx weakness revealed by a follower. Tier 2 doubles it if the
+			// informant is still alive when he spawns.
+			{
+				extern int mymod_herx_debuff;
+				extern uint32_t mymod_herx_informant;
+				if ( mymod_herx_debuff > 0 )
+				{
+					int mult = 1;
+					if ( mymod_herx_informant != 0 )
+					{
+						Entity* inf = uidToEntity(mymod_herx_informant);
+						if ( inf && inf->getStats() && inf->getStats()->HP > 0 ) { mult = 2; }
+					}
+					switch ( mymod_herx_debuff )
+					{
+						case 1: myStats->CON = std::max(0, myStats->CON - 3 * mult); break;
+						case 2: myStats->STR = std::max(0, myStats->STR - 4 * mult); break;
+						case 3: myStats->MAXHP = std::max(100, myStats->MAXHP - 200 * mult);
+								myStats->HP = myStats->MAXHP; myStats->OLDHP = myStats->HP; break;
+						case 4: myStats->DEX = std::max(0, myStats->DEX - 4 * mult); break;
+						default: break;
+					}
+					printlog("[MYMOD] Herx debuff %d applied (tier %d): HP=%d STR=%d DEX=%d CON=%d",
+						mymod_herx_debuff, mult, myStats->MAXHP, myStats->STR, myStats->DEX, myStats->CON);
+				}
+			}
 
 			// generate the default inventory items for the monster, provided the editor sprite allowed enough default slots
 			switch ( defaultItems )
