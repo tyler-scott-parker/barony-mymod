@@ -16,6 +16,8 @@
 #include "../prng.hpp"
 #include "../collision.hpp"
 #include "../interface/interface.hpp"
+#include "../shops.hpp"
+#include "../messages.hpp"
 #include "mymod.hpp"
 #include <thread>
 #include <atomic>
@@ -57,8 +59,9 @@ struct MymodConvo {
 	std::string name;           // follower given-name ("" if none)
 	std::string boon;           // "item:TYPE:N" or "traps:" pending application
 	std::string prefix;         // chat-line label, e.g. "[taunt] " or "Ada's Grix: "
-	uint32_t follower_uid = 0;  // which follower this slot is talking to (0 = world channel)
+	uint32_t follower_uid = 0;  // who this slot is talking to (0 = world channel)
 	uint32_t speaker_uid = 0;   // whose head the bubble goes over
+	bool is_npc = false;        // conversation partner is a non-follower NPC, not a follower
 };
 static MymodConvo mymod_convo[MYMOD_MAX_SLOTS];
 
@@ -421,33 +424,112 @@ static Entity* mymod_findFollower(int pnum) {
 	return best;
 }
 
-// HOST: run one generation for player `pnum` against their nearest follower.
-static void mymod_requestFromPlayer(int pnum, const std::string& says) {
-	if (!mymod_isHost()) return;
-	if (pnum < 0 || pnum >= MAXPLAYERS) return;
+// ---- Non-follower NPCs: townsfolk, merchants, named characters ----------------
+// A player ENGAGES an NPC by clicking them (the game's own affordance), which makes that
+// NPC their conversation partner. /aicommand and voice then address the partner instead of
+// their follower, until the partner dies, is left behind, or another is engaged.
+static uint32_t mymod_partner[MAXPLAYERS] = { 0 };
+static const double MYMOD_PARTNER_RANGE_SQ = (8.0*16) * (8.0*16);  // ~8 tiles; walk away to end it
+
+// Would this entity hold a conversation? Followers are excluded -- they have their own,
+// much richer path. STAT_FLAG_NPC is the game's marker for a talking NPC; for shopkeepers
+// the SAME field means store type instead (it is stored as store + 1, so never 0 for them).
+static bool mymod_isTalkableNPC(Entity* e) {
+	if (!e || e->behavior != &actMonster) return false;
+	Stat* s = e->getStats();
+	if (!s || s->HP <= 0) return false;
+	if (mymod_ownerOf(e) >= 0) return false;                   // it's somebody's follower
+	if (s->MISC_FLAGS[STAT_FLAG_NPC] != 0) return true;        // townsfolk / dialogue NPC / merchant
+	if (s->type == SHOPKEEPER || e->monsterCanTradeWith(-1)) return true;
+	return false;
+}
+
+// What kind of NPC is this, for the prompt? Returns role + shop type + proper name (if any).
+static void mymod_npcDescribe(Entity* e, std::string& role, int& shop, std::string& npcName) {
+	role = "townsfolk"; shop = -1; npcName.clear();
+	Stat* s = e ? e->getStats() : nullptr;
+	if (!s) return;
+	const bool hasProperName = (s->name[0] != '\0' && !monsterNameIsGeneric(*s));
+	if (hasProperName) npcName = s->name;
+	if (s->type == SHOPKEEPER || e->monsterCanTradeWith(-1)) {
+		role = "shopkeeper";
+		shop = e->monsterStoreType;
+	} else if (hasProperName) {
+		role = "named";   // King Arthur, Merlin, Lilith, Gharbad, ... (monster_data.json)
+	}
+}
+
+static bool mymod_partnerInRange(int pnum, Entity* npc) {
+	if (!npc || !players[pnum] || !players[pnum]->entity) return false;
+	Entity* pl = players[pnum]->entity;
+	double dx = npc->x - pl->x, dy = npc->y - pl->y;
+	return (dx*dx + dy*dy) <= MYMOD_PARTNER_RANGE_SQ;
+}
+
+// ---- Merchant dialogue inside the shop window --------------------------------
+// The shop GUI already owns a speech box: updateShopWindow() copies shopspeech[player]
+// into shopGUI.chatStrFull with a typewriter effect. Two hazards, both handled here:
+//   * an idle "chitchat" timer overwrites shopspeech every ~600 ticks, so the AI line is
+//     re-asserted every frame while it is live (the chatStrFull != buf guard inside
+//     updateShopWindow means re-asserting the SAME string is free and does not restart
+//     the typewriter);
+//   * shopspeech is used as a printf FORMAT STRING, so stray % in model output must be
+//     escaped or it corrupts the line. Same hazard as the "%s" guard on speech bubbles.
+static std::string mymod_shopLine[MAXPLAYERS];
+static uint32_t    mymod_shopLineUntil[MAXPLAYERS] = { 0 };
+static const uint32_t MYMOD_SHOPLINE_TICKS = 40 * 50;   // hold ~40s, then vanilla chitchat resumes
+
+static void mymod_setShopLine(int pnum, const std::string& text) {
+	if (pnum < 0 || pnum >= MAXPLAYERS || text.empty()) return;
+	mymod_shopLine[pnum] = messageSanitizePercentSign(text, nullptr);
+	mymod_shopLineUntil[pnum] = ticks + MYMOD_SHOPLINE_TICKS;
+}
+
+// Called every frame on every machine: the shop GUI is local to whoever has it open.
+static void mymod_holdShopLine() {
+	for (int c = 0; c < MAXPLAYERS; ++c) {
+		if (mymod_shopLine[c].empty()) continue;
+		if (ticks >= mymod_shopLineUntil[c]) { mymod_shopLine[c].clear(); continue; }
+		if (!players[c] || !players[c]->isLocalPlayer()) continue;
+		if (!players[c]->shopGUI.bOpen) continue;
+		shopspeech[c] = mymod_shopLine[c];
+	}
+}
+
+// HOST -> one client: a merchant's AI line for the shop window ('MYSH').
+static void mymod_netSendShopLine(int pnum, const std::string& text) {
+	if (multiplayer != SERVER || !net_packet || !net_packet->data) return;
+	if (pnum <= 0 || pnum >= MAXPLAYERS) return;
+	if (client_disconnected[pnum] || players[pnum]->isLocalPlayer()) return;
+	std::string s = text.size() > 400 ? text.substr(0, 400) : text;
+	strcpy((char*)net_packet->data, "MYSH");
+	strcpy((char*)(&net_packet->data[4]), s.c_str());
+	net_packet->address.host = net_clients[pnum - 1].host;
+	net_packet->address.port = net_clients[pnum - 1].port;
+	net_packet->len = 4 + s.length() + 1;
+	sendPacketSafe(net_sock, -1, net_packet, pnum - 1);
+}
+
+// CLIENT: receive a merchant line for our own shop window. Registered as 'MYSH'.
+void mymod_netClientRecvShopLine() {
+	mymod_setShopLine(clientnum, std::string((const char*)(&net_packet->data[4])));
+}
+
+// HOST: fire one generation for player `pnum`. The JSON body is built on the main thread
+// (where the game state is safe to read) and handed to the worker as a finished string, so
+// follower and NPC requests share one transport.
+static void mymod_fireRequest(int pnum, const std::string& payload,
+                              uint32_t targetUID, bool isNPC, const char* logWhat) {
 	MymodConvo& cv = mymod_convo[pnum];
-	if (cv.inflight.load()) {
-		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] still waiting on previous reply...");
-		return;
-	}
-	Entity* follower = mymod_findFollower(pnum);
-	if (!follower) {
-		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] no follower of yours nearby (recruit one first)");
-		return;
-	}
-	std::string raceName = getMonsterLocalizedName(follower->getRace());
-	std::string playerName = (stats[pnum] && stats[pnum]->name[0]) ? stats[pnum]->name : "";
-	int floorNum = currentlevel;
-	int party = mymod_partySize();
-	cv.follower_uid = follower->getUID();
-	cv.speaker_uid  = cv.follower_uid;
-	printlog("[MYMOD] player %d's %s is thinking...", pnum, raceName.c_str());
+	cv.follower_uid = targetUID;
+	cv.speaker_uid  = targetUID;
+	cv.is_npc       = isNPC;
+	printlog("[MYMOD] player %d: %s is thinking...", pnum, logWhat);
 	cv.inflight.store(true);
 	cv.ready.store(false);
 
-	uint32_t followerUID = cv.follower_uid;
 	std::string server = mymod_ai_server;
-	std::thread([raceName, floorNum, says, followerUID, pnum, playerName, party, server]() {
+	std::thread([payload, pnum, server]() {
 		MymodConvo& c = mymod_convo[pnum];
 		// Per-slot temp files: two players generating at once must never share a path.
 		char payloadPath[64], replyPath[64];
@@ -455,13 +537,7 @@ static void mymod_requestFromPlayer(int pnum, const std::string& says) {
 		snprintf(replyPath, sizeof(replyPath), "/tmp/mymod_ai_%d.json", pnum);
 		{
 			FILE* pf = fopen(payloadPath, "w");
-			if (pf) {
-				fprintf(pf, "{\"race\":\"%s\",\"floor\":%d,\"says\":\"%s\",\"uid\":%u,"
-				            "\"player\":%d,\"player_name\":\"%s\",\"party\":%d}",
-					raceName.c_str(), floorNum, mymod_jsonEscape(says).c_str(), (unsigned)followerUID,
-					pnum, mymod_jsonEscape(playerName).c_str(), party);
-				fclose(pf);
-			}
+			if (pf) { fputs(payload.c_str(), pf); fclose(pf); }
 		}
 		char cmd[1536];
 		snprintf(cmd, sizeof(cmd),
@@ -499,6 +575,87 @@ static void mymod_requestFromPlayer(int pnum, const std::string& says) {
 		}
 		c.ready.store(true);
 	}).detach();
+}
+
+// The common head of every conversation payload.
+static std::string mymod_payloadHead(int pnum, const std::string& raceName, uint32_t uid,
+                                     const std::string& says) {
+	std::string playerName = (stats[pnum] && stats[pnum]->name[0]) ? stats[pnum]->name : "";
+	char buf[1024];
+	snprintf(buf, sizeof(buf),
+		"\"race\":\"%s\",\"floor\":%d,\"map\":\"%s\",\"says\":\"%s\",\"uid\":%u,"
+		"\"player\":%d,\"player_name\":\"%s\"",
+		raceName.c_str(), currentlevel, mymod_jsonEscape(map.name).c_str(),
+		mymod_jsonEscape(says).c_str(), (unsigned)uid,
+		pnum, mymod_jsonEscape(playerName).c_str());
+	return std::string(buf);
+}
+
+// HOST: talk to a non-follower NPC. `greeting` is the line they volunteer when engaged.
+static void mymod_requestNPC(int pnum, Entity* npc, const std::string& says, bool greeting) {
+	std::string role, npcName;
+	int shop = -1;
+	mymod_npcDescribe(npc, role, shop, npcName);
+	std::string raceName = getMonsterLocalizedName(npc->getRace());
+	char tail[512];
+	snprintf(tail, sizeof(tail),
+		",\"npc\":true,\"greeting\":%s,\"npc_name\":\"%s\",\"npc_role\":\"%s\",\"shop\":%d",
+		greeting ? "true" : "false", mymod_jsonEscape(npcName).c_str(), role.c_str(), shop);
+	std::string payload = "{" + mymod_payloadHead(pnum, raceName, npc->getUID(), says) + tail + "}";
+	mymod_fireRequest(pnum, payload, npc->getUID(), true,
+		npcName.empty() ? raceName.c_str() : npcName.c_str());
+}
+
+// HOST: run one generation for player `pnum` against their nearest follower.
+static void mymod_requestFollower(int pnum, const std::string& says) {
+	Entity* follower = mymod_findFollower(pnum);
+	if (!follower) {
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] nobody of yours nearby to talk to");
+		return;
+	}
+	std::string raceName = getMonsterLocalizedName(follower->getRace());
+	char tail[64];
+	snprintf(tail, sizeof(tail), ",\"party\":%d", mymod_partySize());
+	std::string payload = "{" + mymod_payloadHead(pnum, raceName, follower->getUID(), says) + tail + "}";
+	mymod_fireRequest(pnum, payload, follower->getUID(), false, raceName.c_str());
+}
+
+// HOST: whoever this player is addressing right now. An engaged NPC wins over the follower
+// until they die, are left behind, or the player engages someone else.
+static void mymod_requestFromPlayer(int pnum, const std::string& says) {
+	if (!mymod_isHost()) return;
+	if (pnum < 0 || pnum >= MAXPLAYERS) return;
+	if (mymod_convo[pnum].inflight.load()) {
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] still waiting on previous reply...");
+		return;
+	}
+	if (mymod_partner[pnum] != 0) {
+		Entity* npc = uidToEntity(mymod_partner[pnum]);
+		if (npc && mymod_isTalkableNPC(npc) && mymod_partnerInRange(pnum, npc)) {
+			mymod_requestNPC(pnum, npc, says, false);
+			return;
+		}
+		mymod_partner[pnum] = 0;   // dead, gone, or walked away from
+	}
+	mymod_requestFollower(pnum, says);
+}
+
+// HOST: a player engaged an NPC (clicked them). Make them the conversation partner and
+// have them say something. Called from handleMonsterChatter and from the shop-open path.
+// Returns TRUE only if an AI line is actually on its way. The caller falls back to the
+// game's own canned dialogue when this returns false, so an NPC is never mute -- if the
+// service is down, or the player is mid-reply, or they re-clicked someone they are already
+// talking to, vanilla fills the gap instead of silence.
+bool mymod_npcEngage(int pnum, Entity* npc) {
+	if (!mymod_isHost()) return false;
+	if (pnum < 0 || pnum >= MAXPLAYERS) return false;
+	if (!mymod_isTalkableNPC(npc)) return false;
+	const bool switching = (mymod_partner[pnum] != npc->getUID());
+	mymod_partner[pnum] = npc->getUID();
+	if (mymod_convo[pnum].inflight.load()) return false;  // already mid-line; don't queue a second
+	if (!switching) return false;    // re-clicking your current partner: let vanilla chatter fill in
+	mymod_requestNPC(pnum, npc, "", true);
+	return true;
 }
 
 // Local entry point: /aicommand and the voice bridge both land here.
@@ -557,6 +714,31 @@ static void mymod_deliverSlot(int slot) {
 	const bool isWorld = (slot == MYMOD_WORLD_SLOT);
 	const int pnum = isWorld ? clientnum : slot;
 	Entity* follower = (cv.follower_uid != 0) ? uidToEntity(cv.follower_uid) : nullptr;
+
+	// Non-follower NPCs: no boons, no renaming, no commands -- none of that applies to
+	// someone who isn't following you. A merchant whose shop this player has open speaks
+	// in the shop window instead of a floating bubble, since that is where the player is
+	// looking; everyone else gets the usual bubble + shared chat line.
+	if (!isWorld && cv.is_npc) {
+		const bool inShop = (players[pnum] && players[pnum]->shopGUI.bOpen
+			&& shopkeeper[pnum] == cv.follower_uid);
+		if (inShop) {
+			if (players[pnum]->isLocalPlayer()) mymod_setShopLine(pnum, reply);
+			else                                mymod_netSendShopLine(pnum, reply);
+		}
+		std::string who = (follower && follower->getStats() && follower->getStats()->name[0])
+			? follower->getStats()->name
+			: (follower ? getMonsterLocalizedName(follower->getRace()) : std::string("someone"));
+		char pbuf[192];
+		snprintf(pbuf, sizeof(pbuf), "%s: ", who.c_str());
+		// Bubble only when the line is not already being shown inside the shop window.
+		mymod_broadcastLine(inShop ? 0 : cv.speaker_uid, pbuf, reply);
+		cv.prefix.clear();
+		cv.speaker_uid = 0;
+		cv.follower_uid = 0;
+		cv.is_npc = false;
+		return;
+	}
 
 	if (!boon.empty() && follower) {
 		mymod_applyBoon(boon, follower);
@@ -650,6 +832,9 @@ void mymod_loadServerConfig() {
 // reach the service; in particular a client firing "new_run" would wipe the host's run state.
 void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor) {
 	if (!mymod_isHost()) return;
+	if (etype && !strcmp(etype, "new_run")) {
+		for (int c = 0; c < MAXPLAYERS; ++c) { mymod_partner[c] = 0; mymod_shopLine[c].clear(); }
+	}
 	std::string t = etype ? etype : "";
 	std::string r = getMonsterLocalizedName((Monster)raceEnum);
 	if (r.empty()) r = "monster";
@@ -713,6 +898,7 @@ void mymod_debugPing() {
 void mymod_pollAI() {
 	mymod_loadServerConfig();
 	mymod_pollPTT();
+	mymod_holdShopLine();   // the shop GUI is local to whoever has it open, host or client
 	if (!mymod_isHost()) {
 		return;   // clients receive dialogue as vanilla MSGS/BUBL packets; nothing to poll
 	}

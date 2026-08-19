@@ -12218,6 +12218,15 @@ bool handleMonsterChatter(int monsterclicked, bool ringconflict, char namesays[6
 		//Instant fail if ring of conflict is in effect/not NPC
 		return false;
 	}
+	// MYMOD: engage this NPC in AI conversation instead of saying a canned line. Falls
+	// through to the vanilla canned line if the mod declines, so NPCs are never mute.
+	{
+		extern bool mymod_npcEngage(int player, Entity* npc);
+		if ( mymod_npcEngage(monsterclicked, my) )
+		{
+			return true;
+		}
+	}
 
 	int NPCtype = myStats->MISC_FLAGS[STAT_FLAG_NPC] & 0xFF; // get NPC type, lowest 8 bits.
 	int NPClastLines[MAXPLAYERS];

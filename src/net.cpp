@@ -6326,6 +6326,9 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 	// MYMOD: a follower named itself; keep the client's copy in sync for the party HUD
 	{'MYNM', [](){ mymod_netClientRecvName(); }},
 
+	// MYMOD: a merchant's AI line, for this client's own shop window
+	{'MYSH', [](){ mymod_netClientRecvShopLine(); }},
+
 	// text bubbles
 	{'BUBL', []() {
 		Uint32 uid = SDLNet_Read32(&net_packet->data[4]);

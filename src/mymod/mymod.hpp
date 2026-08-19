@@ -29,3 +29,9 @@ bool mymod_busy(int player);                          // is this player mid-gene
 // --- netcode entry points, registered in net.cpp's packet tables ---
 void mymod_netServerRecvSays();   // 'MYAI'  client -> host: "my player said X to their follower"
 void mymod_netClientRecvName();   // 'MYNM'  host -> client: a follower named itself
+void mymod_netClientRecvShopLine();// 'MYSH'  host -> client: a merchant's line for the shop window
+
+// --- non-follower NPCs (townsfolk, merchants, named characters) ---
+// Called when a player engages an NPC: from handleMonsterChatter (clicking a talking NPC)
+// and from startTradingServer (opening a merchant's shop).
+bool mymod_npcEngage(int player, Entity* npc);   // true = an AI line is coming; false = use vanilla

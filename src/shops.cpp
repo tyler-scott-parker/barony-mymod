@@ -182,6 +182,12 @@ void startTradingServer(Entity* entity, int player)
 	entity->skill[0] = 4; // talk state
 	entity->skill[1] = players[player]->entity->getUID();
 	messagePlayer(player, MESSAGE_HINT, Language::get(1122), stats->name);
+	// MYMOD: the merchant greets this customer in their own words, in the shop window.
+	// Placed at the end so it covers local players and remote clients alike.
+	{
+		extern bool mymod_npcEngage(int player, Entity* npc);
+		mymod_npcEngage(player, entity);
+	}
 }
 
 /*-------------------------------------------------------------------------------
