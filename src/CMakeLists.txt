@@ -1,5 +1,6 @@
 list(APPEND GAME_SOURCES
 	"${CMAKE_CURRENT_SOURCE_DIR}/main.cpp"
+	"${CMAKE_CURRENT_SOURCE_DIR}/mymod/mymod.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/init.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/collision.cpp"
 	"${CMAKE_CURRENT_SOURCE_DIR}/light.cpp"
