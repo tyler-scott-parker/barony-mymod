@@ -911,46 +911,7 @@ namespace ConsoleCommands {
 
 	static ConsoleCommand ccmd_aitest("/aitest", "MYMOD: talk to nearest monster via Ollama (async)", []CCMD{
 		if (!(svFlags & SV_FLAG_CHEATS)) { messagePlayer(clientnum, MESSAGE_MISC, Language::get(277)); return; }
-		if (!players[clientnum] || !players[clientnum]->entity) { return; }
-		if (mymod_ai_inflight.load()) { messagePlayer(clientnum, MESSAGE_MISC, "[MYMOD] still waiting on previous reply..."); return; }
-		Entity* pl = players[clientnum]->entity;
-		Entity* nearest = nullptr;
-		double bestDist = 1e18;
-		for (auto node = map.entities->first; node != NULL; node = node->next) {
-			auto entity = (Entity*)node->element;
-			if (entity->behavior == &actMonster && entity != pl) {
-				double dx = entity->x - pl->x, dy = entity->y - pl->y;
-				double d = dx*dx + dy*dy;
-				if (d < bestDist) { bestDist = d; nearest = entity; }
-			}
-		}
-		if (!nearest) { messagePlayer(clientnum, MESSAGE_MISC, "[MYMOD] no monster nearby"); return; }
-		std::string raceName = getMonsterLocalizedName(nearest->getRace());
-		int floorNum = currentlevel;
-		printlog("[MYMOD] %s (floor %d) is thinking...", raceName.c_str(), floorNum);
-		mymod_ai_inflight.store(true);
-		mymod_ai_ready.store(false);
-		std::thread([raceName, floorNum]() {
-			char cmd[2048];
-			snprintf(cmd, sizeof(cmd),
-				"curl -s %s -X POST -d '{\"race\":\"%s\",\"floor\":%d}' | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"reply\"])'",
-				mymod_ai_server.c_str(),
-				raceName.c_str(), floorNum);
-			FILE* pipe = popen(cmd, "r");
-			std::string reply;
-			if (pipe) {
-				char buf[4096];
-				while (fgets(buf, sizeof(buf), pipe)) reply += buf;
-				pclose(pipe);
-			}
-			while (!reply.empty() && (reply.back() == '\n' || reply.back() == '\r')) reply.pop_back();
-			if (reply.empty()) reply = "(no reply from AI)";
-			{
-				std::lock_guard<std::mutex> lock(mymod_ai_mutex);
-				mymod_ai_reply = reply;
-			}
-			mymod_ai_ready.store(true);
-		}).detach();
+		mymod_debugPing();
 		});
 
 			static ConsoleCommand ccmd_maxleadership("/maxleadership", "MYMOD: set player LEADERSHIP to 100 (for attack cmd)", []CCMD{

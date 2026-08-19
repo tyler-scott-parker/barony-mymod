@@ -1,5 +1,9 @@
 // mymod.cpp — AI-NPC mod implementation. All mod logic lives here so that
 // upstream Barony files carry only one-line hooks (see HOOKS.md).
+//
+// MULTIPLAYER: host-authoritative. The host is the only machine that reaches the
+// Python AI service; clients relay their utterances to it over Barony's netcode and
+// receive dialogue back through the vanilla MSGS/BUBL paths. See mymod.hpp.
 #include "../main.hpp"
 #include "../game.hpp"
 #include "../stat.hpp"
@@ -14,9 +18,24 @@
 #include "../interface/interface.hpp"
 #include "mymod.hpp"
 #include <thread>
+#include <atomic>
+#include <mutex>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <unordered_map>
+#include <SDL.h>
+
+// Conversation slots are indexed by player number, with one extra slot for the world
+// (ambient babble / enemy taunts). Derived from MAXPLAYERS so it can never drift from it.
+static const int MYMOD_MAX_SLOTS  = MAXPLAYERS + 1;
+static const int MYMOD_WORLD_SLOT = MAXPLAYERS;   // ambient babble + enemy taunts
+
+// Trim trailing characters (default: line endings) from a string, in place.
+static void mymod_trimTail(std::string& v, const char* chars = "\n\r") {
+	while (!v.empty() && strchr(chars, v.back())) v.pop_back();
+}
 
 static const uint32_t MYMOD_BABBLE_MIN_TICKS = 30 * 50;   // 30s
 static const uint32_t MYMOD_BABBLE_MAX_TICKS = 75 * 50;   // 75s
@@ -24,42 +43,157 @@ static const int      MYMOD_BABBLE_FIRE_PCT  = 40;        // % chance to actuall
 static const uint32_t MYMOD_TAUNT_COOLDOWN   = 20 * 50;   // 20s per-enemy
 static const uint32_t MYMOD_FIGHT_COOLDOWN   = 45 * 50;   // 45s per-follower (anti-spam for shared fights)
 static const double   MYMOD_EARSHOT_SQ        = (10.0*16) * (10.0*16); // ~10 tiles, squared, in world units
+static const uint32_t MYMOD_CLIENT_SEND_COOLDOWN = 1 * 50;  // 1s between a client's sends (anti-flood only)
 
-void mymod_sendToFollower(const std::string& says);  // global fwd for namespaced callers
-// ---- MYMOD async AI conversation state (global, declared before all uses) ----
-std::mutex mymod_ai_mutex;
-std::string mymod_ai_reply;
-std::atomic<bool> mymod_ai_ready{false};
-std::atomic<bool> mymod_ai_inflight{false};
-std::string mymod_ai_action;        // action string from service ("FOLLOW"/"DEFEND"/"WAIT"/"NONE")
-std::string mymod_ai_name;          // follower given-name from service ("" if none)
-int mymod_herx_debuff = 0;           // 0 none, 1..4 = revealed weakness variant
-uint32_t mymod_herx_informant = 0;   // uid of the follower who told you
-std::string mymod_ai_boon;           // "item:TYPE:N" or "traps:" pending application
-std::string mymod_chat_prefix;       // "[taunt] "/"[overheard] " label for the chat line
-uint32_t mymod_ai_follower_uid = 0;   // which follower the command targets (0 = none)
-uint32_t mymod_ai_enemy_uid = 0;      // resolved at fire time for ATTACK (0 = none)
-#include <cstdio>
-#include <unordered_map>
-#include <SDL.h>
-bool mymod_ptt_down = false;          // is the push-to-talk key currently held?
-std::string mymod_ai_server = "http://localhost:5001";  // configurable backend endpoint (BYO-model)
-// ---- MYMOD ambient babble + combat taunt state ----
-#include <map>
-#include <cstdlib>
-uint32_t mymod_next_babble_tick = 0;               // when the next babble may fire
-std::map<uint32_t, uint32_t> mymod_taunt_cooldowns; // enemy uid -> last taunt tick
-std::map<uint32_t, bool>     mymod_inCombat;        // follower uid -> was in combat last check
-std::map<uint32_t, uint32_t> mymod_fightCooldown;   // follower uid -> last fought_alongside tick
-std::string mymod_ambient_label;                    // "[overheard]" or "[taunt]" for display
-uint32_t mymod_ambient_speaker_uid = 0;              // which entity spoke the ambient/taunt line (for its bubble)
+// ---- Per-slot conversation state -------------------------------------------
+// One slot per player (index == player number) so four players can each hold their own
+// conversation without stomping each other, plus MYMOD_WORLD_SLOT for ambient/taunts.
+struct MymodConvo {
+	std::mutex mutex;
+	std::atomic<bool> ready{false};
+	std::atomic<bool> inflight{false};
+	std::string reply;          // speech from the service
+	std::string action;         // "FOLLOW"/"DEFEND"/"WAIT"/"ATTACK"/"NONE"
+	std::string name;           // follower given-name ("" if none)
+	std::string boon;           // "item:TYPE:N" or "traps:" pending application
+	std::string prefix;         // chat-line label, e.g. "[taunt] " or "Ada's Grix: "
+	uint32_t follower_uid = 0;  // which follower this slot is talking to (0 = world channel)
+	uint32_t speaker_uid = 0;   // whose head the bubble goes over
+};
+static MymodConvo mymod_convo[MYMOD_MAX_SLOTS];
+
+bool mymod_busy(int player) {
+	if (player < 0 || player >= MYMOD_MAX_SLOTS) return false;
+	return mymod_convo[player].inflight.load();
+}
+
+// Run-global Herx state: one boss, one secret per playthrough, whichever player learns it.
+int mymod_herx_debuff = 0;
+uint32_t mymod_herx_informant = 0;
+
+std::string mymod_ai_server = "http://localhost:5001";  // host-side only (BYO-model)
+bool mymod_ptt_down = false;                            // is the push-to-talk key currently held?
+
+// ---- ambient babble + combat taunt state (host only) ----
+static uint32_t mymod_next_babble_tick = 0;                // when the next babble may fire
+static std::map<uint32_t, uint32_t> mymod_taunt_cooldowns; // enemy uid -> last taunt tick
+static std::map<uint32_t, bool>     mymod_inCombat;        // follower uid -> was in combat last check
+static std::map<uint32_t, uint32_t> mymod_fightCooldown;   // follower uid -> last fought_alongside tick
+
+// Are we the machine that owns world state and talks to the AI service?
+static inline bool mymod_isHost() { return multiplayer != CLIENT; }
+
+// Which player leads this monster? Prefers monsterAllyIndex (replicated as skill[42]),
+// falls back to leader_uid — forceFollower() clears monsterAllyIndex before our hook runs,
+// so the fallback is what covers the /friendly + force-recruit path. -1 = no player leader.
+static int mymod_ownerOf(Entity* mon) {
+	if (!mon) return -1;
+	if (mon->monsterAllyIndex >= 0 && mon->monsterAllyIndex < MAXPLAYERS) return mon->monsterAllyIndex;
+	Stat* s = mon->getStats();
+	if (s && s->leader_uid) {
+		Entity* ld = uidToEntity(s->leader_uid);
+		if (ld && ld->behavior == &actPlayer && ld->skill[2] >= 0 && ld->skill[2] < MAXPLAYERS) {
+			return ld->skill[2];
+		}
+	}
+	return -1;
+}
+
+// How many players are actually in this run (drives the co-op framing in the prompt).
+static int mymod_partySize() {
+	int n = 0;
+	for (int c = 0; c < MAXPLAYERS; ++c) { if (!client_disconnected[c]) n++; }
+	return n < 1 ? 1 : n;
+}
+
+// JSON-escape a string so spoken apostrophes, quotes, etc. can never break the payload.
+static std::string mymod_jsonEscape(const std::string& in) {
+	std::string esc;
+	for (char ch : in) {
+		switch (ch) {
+			case '"':  esc += "\\\""; break;
+			case '\\': esc += "\\\\"; break;
+			case '\n': esc += "\\n"; break;
+			case '\r': esc += "\\r"; break;
+			case '\t': esc += "\\t"; break;
+			default:
+				if ((unsigned char)ch < 0x20) { char b[8]; snprintf(b, sizeof(b), "\\u%04x", ch); esc += b; }
+				else esc += ch;
+		}
+	}
+	return esc;
+}
+
+// =============================================================================
+//  NETCODE
+// =============================================================================
+
+// CLIENT -> host: "player N said this to their follower". The host does all the compute.
+static void mymod_netSendSays(const std::string& says) {
+	if (multiplayer != CLIENT || !net_packet || !net_packet->data) return;
+	// 4 id + 1 player + string + NUL must fit the packet buffer.
+	const size_t maxsay = NET_PACKET_SIZE - 6;
+	std::string s = says.size() > maxsay ? says.substr(0, maxsay) : says;
+	strcpy((char*)net_packet->data, "MYAI");
+	net_packet->data[4] = (Uint8)clientnum;
+	strcpy((char*)(&net_packet->data[5]), s.c_str());
+	net_packet->address.host = net_server.host;
+	net_packet->address.port = net_server.port;
+	net_packet->len = 5 + s.length() + 1;
+	sendPacketSafe(net_sock, -1, net_packet, 0);
+}
+
+static void mymod_requestFromPlayer(int pnum, const std::string& says);  // fwd
+
+// HOST: a client asked their follower something. Registered as 'MYAI' in serverPacketHandlers.
+void mymod_netServerRecvSays() {
+	const int pnum = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));
+	client_keepalive[pnum] = ticks;
+	std::string says((const char*)(&net_packet->data[5]));
+	mymod_requestFromPlayer(pnum, says);
+}
+
+// HOST -> clients: a follower chose a name. Clients keep monster stats in clientStats,
+// which vanilla only fills at recruit time ('LEAD'), so a later rename needs its own packet.
+static void mymod_netBroadcastName(uint32_t uid, const std::string& name) {
+	if (multiplayer != SERVER || !net_packet || !net_packet->data) return;
+	for (int c = 1; c < MAXPLAYERS; ++c) {
+		if (client_disconnected[c] || players[c]->isLocalPlayer()) continue;
+		strcpy((char*)net_packet->data, "MYNM");
+		SDLNet_Write32(uid, &net_packet->data[4]);
+		strncpy((char*)(&net_packet->data[8]), name.c_str(), 63);
+		net_packet->data[8 + 63] = '\0';
+		net_packet->address.host = net_clients[c - 1].host;
+		net_packet->address.port = net_clients[c - 1].port;
+		net_packet->len = 8 + strlen((char*)(&net_packet->data[8])) + 1;
+		sendPacketSafe(net_sock, -1, net_packet, c - 1);
+	}
+}
+
+// CLIENT: apply a follower's chosen name so the party HUD shows it. Registered as 'MYNM'.
+void mymod_netClientRecvName() {
+	Uint32 uid = SDLNet_Read32(&net_packet->data[4]);
+	const char* nm = (const char*)(&net_packet->data[8]);
+	Entity* mon = uidToEntity(uid);
+	if (!mon) return;
+	if (!mon->clientsHaveItsStats) mon->giveClientStats();
+	if (mon->clientStats) {
+		strncpy(mon->clientStats->name, nm, sizeof(mon->clientStats->name) - 1);
+		mon->clientStats->name[sizeof(mon->clientStats->name) - 1] = '\0';
+	}
+}
+
+// =============================================================================
+//  INPUT
+// =============================================================================
 
 // Push-to-talk: poll the V key, write START/STOP signal files for the Python voice bridge.
-void mymod_sendToFollower(const std::string& says);  // fwd decl
+// Runs on every machine — a client that chooses to run the voice bridge gets voice too,
+// and the transcribed text goes out over the same client->host path as typed text.
 void mymod_pollPTT() {
 	extern std::unordered_map<SDL_Keycode, bool> keystatus;
 	// Voice result: if the bridge dropped transcribed text, feed it to the follower.
-	if (!mymod_ai_inflight.load()) {
+	if (!mymod_busy(clientnum)) {
 		FILE* rf = fopen("/tmp/mymod_voice_text.txt", "r");
 		if (rf) {
 			std::string vtext; char vb[1024];
@@ -69,7 +203,7 @@ void mymod_pollPTT() {
 			// trim + junk filter: need at least one letter (skips "", ". . .", hallucinated silence)
 			bool hasLetter = false;
 			for (char c : vtext) { if ((c>='a'&&c<='z')||(c>='A'&&c<='Z')) { hasLetter = true; break; } }
-			while (!vtext.empty() && (vtext.back()=='\n'||vtext.back()=='\r'||vtext.back()==' ')) vtext.pop_back();
+			mymod_trimTail(vtext, "\n\r ");
 			if (hasLetter && vtext.size() >= 2) {
 				messagePlayer(clientnum, MESSAGE_MISC, "[MYMOD] you said: %s", vtext.c_str());
 				mymod_sendToFollower(vtext);
@@ -89,8 +223,10 @@ void mymod_pollPTT() {
 	mymod_ptt_down = down;
 }
 
-// Ambient babble + combat taunts. Called each frame from mymod_pollAI().
-void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor); // fwd
+// =============================================================================
+//  BOONS  (host-side: items and trap sabotage are authoritative world changes)
+// =============================================================================
+
 // Disable every trap on the floor via Barony's own sabotage flag. Returns count.
 static int mymod_disarmFloorTraps() {
 	int n = 0;
@@ -109,6 +245,13 @@ static int mymod_disarmFloorTraps() {
 	return n;
 }
 
+// Item names the service may send in a boon payload, mapped to Barony's ItemType.
+static const struct { const char* name; ItemType type; } MYMOD_BOON_ITEMS[] = {
+	{"FOOD_BREAD", FOOD_BREAD}, {"FOOD_CHEESE", FOOD_CHEESE}, {"GEM_GLASS", GEM_GLASS},
+	{"TOOL_TORCH", TOOL_TORCH}, {"POTION_HEALING", POTION_HEALING},
+	{"POTION_EXTRAHEALING", POTION_EXTRAHEALING}, {"GEM_GARNET", GEM_GARNET},
+};
+
 // Apply a pending boon payload: "traps:" or "item:ITEMNAME:count".
 static void mymod_applyBoon(const std::string& payload, Entity* giver) {
 	if (payload.empty()) return;
@@ -123,16 +266,10 @@ static void mymod_applyBoon(const std::string& payload, Entity* giver) {
 		std::string iname = (c == std::string::npos) ? rest : rest.substr(0, c);
 		int count = (c == std::string::npos) ? 1 : atoi(rest.substr(c + 1).c_str());
 		if (count < 1) count = 1;
-		ItemType t = FOOD_BREAD;
-		if (iname == "FOOD_BREAD") t = FOOD_BREAD;
-		else if (iname == "FOOD_CHEESE") t = FOOD_CHEESE;
-		else if (iname == "GEM_GLASS") t = GEM_GLASS;
-		else if (iname == "TOOL_TORCH") t = TOOL_TORCH;
-		else if (iname == "POTION_HEALING") t = POTION_HEALING;
-		else if (iname == "POTION_EXTRAHEALING") t = POTION_EXTRAHEALING;
-		else if (iname == "GEM_GARNET") t = GEM_GARNET;
-		else { printlog("[MYMOD] unknown boon item '%s'", iname.c_str()); return; }
-		Item* it = newItem(t, EXCELLENT, 0, (Sint16)count, 0, true, nullptr);
+		const ItemType* t = nullptr;
+		for (const auto& b : MYMOD_BOON_ITEMS) { if (iname == b.name) { t = &b.type; break; } }
+		if (!t) { printlog("[MYMOD] unknown boon item '%s'", iname.c_str()); return; }
+		Item* it = newItem(*t, EXCELLENT, 0, (Sint16)count, 0, true, nullptr);
 		if (it) {
 			dropItemMonster(it, giver, giver->getStats(), (Sint16)count);
 			printlog("[MYMOD] follower gave boon item %s x%d", iname.c_str(), count);
@@ -140,17 +277,52 @@ static void mymod_applyBoon(const std::string& payload, Entity* giver) {
 	}
 }
 
+// =============================================================================
+//  AMBIENT / TAUNTS  (host only — one shared world channel)
+// =============================================================================
+
+// Fire an ambient/taunt generation on the world slot. The taunt and babble paths
+// differ ONLY in the JSON body, so both go through here.
+static void mymod_asyncAmbient(const std::string& payload) {
+	MymodConvo& cv = mymod_convo[MYMOD_WORLD_SLOT];
+	cv.inflight.store(true);
+	cv.ready.store(false);
+	cv.follower_uid = 0;
+	std::string server = mymod_ai_server;
+	std::thread([payload, server]() {
+		MymodConvo& c = mymod_convo[MYMOD_WORLD_SLOT];
+		char cmd[2048];
+		snprintf(cmd, sizeof(cmd),
+			"curl -s %s -X POST -d '%s' > /tmp/mymod_amb.json 2>/dev/null; "
+			"python3 -c 'import json;print(json.load(open(\"/tmp/mymod_amb.json\")).get(\"reply\",\"\"))'",
+			server.c_str(), payload.c_str());
+		FILE* p = popen(cmd, "r"); std::string out;
+		if (p) { char b[2048]; while (fgets(b, sizeof(b), p)) out += b; pclose(p); }
+		mymod_trimTail(out);
+		{ std::lock_guard<std::mutex> lk(c.mutex); c.reply = out; c.action = "NONE"; }
+		c.ready.store(true);
+	}).detach();
+}
+
+// Is ANY player mid-conversation? Ambient defers to real dialogue so the two never
+// contend for the GPU (one 8B generation at a time keeps replies at 2-4s).
+static bool mymod_anyPlayerBusy() {
+	for (int c = 0; c < MAXPLAYERS; ++c) { if (mymod_convo[c].inflight.load()) return true; }
+	return false;
+}
+
 void mymod_ambientTick() {
-	// Fight-survival scan: runs first so combat is tracked every frame, even during conversations.
-	if (players[clientnum] && players[clientnum]->entity && !intro && map.entities) {
-		Entity* fpl = players[clientnum]->entity;
-		extern Uint32 ticks;
-		Uint32 myFightUID = fpl->getUID();
+	if (!mymod_isHost()) return;
+	// Fight-survival scan: runs first so combat is tracked every frame, even during
+	// conversations. Covers EVERY player's followers, not just the host's.
+	if (!intro && map.entities) {
 		for (auto fn = map.entities->first; fn != NULL; fn = fn->next) {
 			auto fe = (Entity*)fn->element;
 			if (fe->behavior != &actMonster) continue;
+			int owner = mymod_ownerOf(fe);
+			if (owner < 0) continue;
 			Stat* fes = fe->getStats();
-			if (!fes || fes->leader_uid != myFightUID) continue;
+			if (!fes) continue;
 			uint32_t fuid = fe->getUID();
 			if (fes->HP <= 0) { mymod_inCombat[fuid] = false; continue; }
 			bool inCombat = (fe->monsterState == MONSTER_STATE_ATTACK || fe->monsterState == MONSTER_STATE_HUNT);
@@ -166,10 +338,10 @@ void mymod_ambientTick() {
 			}
 		}
 	}
-	extern Uint32 ticks;
-	if (mymod_ai_inflight.load()) return;                 // one generation at a time
+	if (mymod_convo[MYMOD_WORLD_SLOT].inflight.load()) return;   // one world line at a time
+	if (mymod_anyPlayerBusy()) return;                           // player dialogue has priority
 	if (!players[clientnum] || !players[clientnum]->entity) return;
-	if (intro || !map.entities) return;                   // not in a live level
+	if (intro || !map.entities) return;                          // not in a live level
 	Entity* pl = players[clientnum]->entity;
 
 	// Scan once for in-earshot monsters; note the nearest fighting one and collect calm ones.
@@ -199,23 +371,12 @@ void mymod_ambientTick() {
 	if (tauntTarget) {
 		mymod_taunt_cooldowns[tauntTarget->getUID()] = ticks;
 		std::string raceName = getMonsterLocalizedName(tauntTarget->getRace());
-		mymod_ambient_label = "[taunt]";
-		mymod_ambient_speaker_uid = tauntTarget->getUID();
-		mymod_ai_inflight.store(true);
-		mymod_ai_ready.store(false);
-		std::thread([raceName]() {
-			char cmd[2048];
-			snprintf(cmd, sizeof(cmd),
-				"curl -s %s -X POST -d '{\"race\":\"%s\",\"floor\":%d,\"taunt\":true}' > /tmp/mymod_amb.json 2>/dev/null; "
-				"python3 -c 'import json;print(json.load(open(\"/tmp/mymod_amb.json\")).get(\"reply\",\"\"))'",
-				mymod_ai_server.c_str(), raceName.c_str(), currentlevel);
-			FILE* p = popen(cmd, "r"); std::string out;
-			if (p){char b[2048]; while(fgets(b,sizeof(b),p)) out+=b; pclose(p);}
-			while(!out.empty() && (out.back()=='\n'||out.back()=='\r')) out.pop_back();
-			{ std::lock_guard<std::mutex> lk(mymod_ai_mutex); mymod_ai_reply = out; mymod_ai_action = "NONE"; }
-			mymod_ai_ready.store(true);
-		}).detach();
-		mymod_ai_follower_uid = 0;
+		mymod_convo[MYMOD_WORLD_SLOT].prefix = "[taunt] ";
+		mymod_convo[MYMOD_WORLD_SLOT].speaker_uid = tauntTarget->getUID();
+		char payload[512];
+		snprintf(payload, sizeof(payload), "{\"race\":\"%s\",\"floor\":%d,\"taunt\":true}",
+			raceName.c_str(), currentlevel);
+		mymod_asyncAmbient(payload);
 		return;
 	}
 
@@ -226,110 +387,105 @@ void mymod_ambientTick() {
 	if ((rand() % 100) >= MYMOD_BABBLE_FIRE_PCT) return;  // skip this one
 	if (!calmPick) return;
 
-	uint32_t myUID = pl->getUID();
-	Stat* cs = calmPick->getStats();
-	bool isFollower = (cs && cs->leader_uid == myUID);
 	std::string raceName = getMonsterLocalizedName(calmPick->getRace());
-	std::string relation = isFollower ? "follower" : "hostile";
-	mymod_ambient_label = "[overheard]";
-	mymod_ambient_speaker_uid = calmPick->getUID();
-	mymod_ai_inflight.store(true);
-	mymod_ai_ready.store(false);
-	std::thread([raceName, relation]() {
-		char cmd[2048];
-		snprintf(cmd, sizeof(cmd),
-			"curl -s %s -X POST -d '{\"race\":\"%s\",\"floor\":%d,\"ambient\":true,\"relation\":\"%s\"}' > /tmp/mymod_amb.json 2>/dev/null; "
-			"python3 -c 'import json;print(json.load(open(\"/tmp/mymod_amb.json\")).get(\"reply\",\"\"))'",
-			mymod_ai_server.c_str(), raceName.c_str(), currentlevel, relation.c_str());
-		FILE* p = popen(cmd, "r"); std::string out;
-		if (p){char b[2048]; while(fgets(b,sizeof(b),p)) out+=b; pclose(p);}
-		while(!out.empty() && (out.back()=='\n'||out.back()=='\r')) out.pop_back();
-		{ std::lock_guard<std::mutex> lk(mymod_ai_mutex); mymod_ai_reply = out; mymod_ai_action = "NONE"; }
-		mymod_ai_ready.store(true);
-	}).detach();
-	mymod_ai_follower_uid = 0;
+	std::string relation = (mymod_ownerOf(calmPick) >= 0) ? "follower" : "hostile";
+	mymod_convo[MYMOD_WORLD_SLOT].prefix = "[overheard] ";
+	mymod_convo[MYMOD_WORLD_SLOT].speaker_uid = calmPick->getUID();
+	char payload[512];
+	snprintf(payload, sizeof(payload),
+		"{\"race\":\"%s\",\"floor\":%d,\"ambient\":true,\"relation\":\"%s\"}",
+		raceName.c_str(), currentlevel, relation.c_str());
+	mymod_asyncAmbient(payload);
 }
 
-// Shared: send a message (typed OR voice) to the player's follower. Global scope.
-void mymod_sendToFollower(const std::string& says) {
-	if (mymod_ai_inflight.load()) { messagePlayer(clientnum, MESSAGE_MISC, "[MYMOD] still waiting on previous reply..."); return; }
-	if (!players[clientnum] || !players[clientnum]->entity) return;
-	Uint32 myUID = players[clientnum]->entity->getUID();
-	Entity* pl = players[clientnum]->entity;
-	Entity* follower = nullptr;
+// =============================================================================
+//  CONVERSATION  (host-side generation, per player)
+// =============================================================================
+
+// Find the nearest follower belonging to player `pnum`. Host-side: only the host has
+// authoritative Stat->leader_uid for every player's allies.
+static Entity* mymod_findFollower(int pnum) {
+	if (pnum < 0 || pnum >= MAXPLAYERS) return nullptr;
+	if (!players[pnum] || !players[pnum]->entity || !map.entities) return nullptr;
+	Entity* pl = players[pnum]->entity;
+	Entity* best = nullptr;
 	double bestDist = 1e18;
 	for (auto node = map.entities->first; node != NULL; node = node->next) {
-		auto entity = (Entity*)node->element;
-		if (entity->behavior == &actMonster && entity != pl) {
-			Stat* es = entity->getStats();
-			if (es && es->leader_uid == myUID) {
-				double dx = entity->x - pl->x, dy = entity->y - pl->y;
-				double d = dx*dx + dy*dy;
-				if (d < bestDist) { bestDist = d; follower = entity; }
-			}
-		}
+		auto e = (Entity*)node->element;
+		if (e->behavior != &actMonster || e == pl) continue;
+		if (mymod_ownerOf(e) != pnum) continue;
+		double dx = e->x - pl->x, dy = e->y - pl->y;
+		double d = dx*dx + dy*dy;
+		if (d < bestDist) { bestDist = d; best = e; }
 	}
-	if (!follower) { messagePlayer(clientnum, MESSAGE_MISC, "[MYMOD] no follower of yours nearby (recruit one first)"); return; }
+	return best;
+}
+
+// HOST: run one generation for player `pnum` against their nearest follower.
+static void mymod_requestFromPlayer(int pnum, const std::string& says) {
+	if (!mymod_isHost()) return;
+	if (pnum < 0 || pnum >= MAXPLAYERS) return;
+	MymodConvo& cv = mymod_convo[pnum];
+	if (cv.inflight.load()) {
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] still waiting on previous reply...");
+		return;
+	}
+	Entity* follower = mymod_findFollower(pnum);
+	if (!follower) {
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] no follower of yours nearby (recruit one first)");
+		return;
+	}
 	std::string raceName = getMonsterLocalizedName(follower->getRace());
+	std::string playerName = (stats[pnum] && stats[pnum]->name[0]) ? stats[pnum]->name : "";
 	int floorNum = currentlevel;
-	mymod_ai_follower_uid = follower->getUID();
-	uint32_t followerUID = mymod_ai_follower_uid;
-	printlog("[MYMOD] your %s is thinking...", raceName.c_str());
-	mymod_ai_inflight.store(true);
-	mymod_ai_ready.store(false);
-	std::thread([raceName, floorNum, says, followerUID]() {
-		// JSON-escape says properly (quotes, backslashes, control chars) and write the whole
-		// payload to a temp file, so curl reads it with -d @file. This means spoken apostrophes,
-		// quotes, etc. can NEVER break the shell command line or the JSON.
-		std::string esc;
-		for (char ch : says) {
-			switch (ch) {
-				case '"':  esc += "\\\""; break;
-				case '\\': esc += "\\\\"; break;
-				case '\n': esc += "\\n"; break;
-				case '\r': esc += "\\r"; break;
-				case '\t': esc += "\\t"; break;
-				default:
-					if ((unsigned char)ch < 0x20) { char b[8]; snprintf(b,sizeof(b),"\\u%04x",ch); esc += b; }
-					else esc += ch;
-			}
-		}
+	int party = mymod_partySize();
+	cv.follower_uid = follower->getUID();
+	cv.speaker_uid  = cv.follower_uid;
+	printlog("[MYMOD] player %d's %s is thinking...", pnum, raceName.c_str());
+	cv.inflight.store(true);
+	cv.ready.store(false);
+
+	uint32_t followerUID = cv.follower_uid;
+	std::string server = mymod_ai_server;
+	std::thread([raceName, floorNum, says, followerUID, pnum, playerName, party, server]() {
+		MymodConvo& c = mymod_convo[pnum];
+		// Per-slot temp files: two players generating at once must never share a path.
+		char payloadPath[64], replyPath[64];
+		snprintf(payloadPath, sizeof(payloadPath), "/tmp/mymod_payload_%d.json", pnum);
+		snprintf(replyPath, sizeof(replyPath), "/tmp/mymod_ai_%d.json", pnum);
 		{
-			FILE* pf = fopen("/tmp/mymod_payload.json", "w");
+			FILE* pf = fopen(payloadPath, "w");
 			if (pf) {
-				fprintf(pf, "{\"race\":\"%s\",\"floor\":%d,\"says\":\"%s\",\"uid\":%u}",
-					raceName.c_str(), floorNum, esc.c_str(), (unsigned)followerUID);
+				fprintf(pf, "{\"race\":\"%s\",\"floor\":%d,\"says\":\"%s\",\"uid\":%u,"
+				            "\"player\":%d,\"player_name\":\"%s\",\"party\":%d}",
+					raceName.c_str(), floorNum, mymod_jsonEscape(says).c_str(), (unsigned)followerUID,
+					pnum, mymod_jsonEscape(playerName).c_str(), party);
 				fclose(pf);
 			}
 		}
-		char cmd[1024];
+		char cmd[1536];
 		snprintf(cmd, sizeof(cmd),
-			"curl -s %s -X POST -H 'Content-Type: application/json' --data @/tmp/mymod_payload.json > /tmp/mymod_ai.json 2>/dev/null; "
-			"python3 -c 'import json;d=json.load(open(\"/tmp/mymod_ai.json\"));print(d.get(\"reply\",\"\"));print(\"::ACTION::\"+d.get(\"action\",\"NONE\"));print(\"::NAME::\"+d.get(\"name\",\"\"));print(\"::SECRET::\"+d.get(\"secret\",\"\"));print(\"::BOON::\"+d.get(\"boon\",\"\"))'",
-			mymod_ai_server.c_str());
+			"curl -s %s -X POST -H 'Content-Type: application/json' --data @%s > %s 2>/dev/null; "
+			"python3 -c 'import json;d=json.load(open(\"%s\"));print(d.get(\"reply\",\"\"));print(\"::ACTION::\"+d.get(\"action\",\"NONE\"));print(\"::NAME::\"+d.get(\"name\",\"\"));print(\"::SECRET::\"+d.get(\"secret\",\"\"));print(\"::BOON::\"+d.get(\"boon\",\"\"))'",
+			server.c_str(), payloadPath, replyPath, replyPath);
 		FILE* pipe = popen(cmd, "r");
 		std::string out;
 		if (pipe) { char buf[4096]; while (fgets(buf, sizeof(buf), pipe)) out += buf; pclose(pipe); }
 		std::string speech = out, action = "NONE";
 		size_t mark = out.find("::ACTION::");
 		if (mark != std::string::npos) { speech = out.substr(0, mark); action = out.substr(mark + 10); }
-		while (!speech.empty() && (speech.back()=='\n'||speech.back()=='\r')) speech.pop_back();
-		while (!action.empty() && (action.back()=='\n'||action.back()=='\r')) action.pop_back();
+		mymod_trimTail(speech);
+		mymod_trimTail(action);
 		if (speech.empty()) speech = "(no reply)";
-		// Split the tagged tail: reply\n::ACTION::X\n::NAME::Y\n::SECRET::Z
-		std::string gname, sec;
+		// Split the tagged tail: reply\n::ACTION::X\n::NAME::Y\n::SECRET::Z\n::BOON::W
+		std::string gname, sec, boon;
 		size_t nmark = action.find("::NAME::");
 		if (nmark != std::string::npos) { gname = action.substr(nmark + 8); action = action.substr(0, nmark); }
 		size_t smark = gname.find("::SECRET::");
 		if (smark != std::string::npos) { sec = gname.substr(smark + 10); gname = gname.substr(0, smark); }
-		auto mymod_trim = [](std::string& v) {
-			while (!v.empty() && (v.back()=='\n'||v.back()=='\r'||v.back()==' '||v.back()=='\t')) v.pop_back();
-		};
-		std::string boon;
 		size_t bmark = sec.find("::BOON::");
 		if (bmark != std::string::npos) { boon = sec.substr(bmark + 8); sec = sec.substr(0, bmark); }
-		mymod_trim(action); mymod_trim(gname); mymod_trim(sec); mymod_trim(boon);
-		mymod_ai_boon = boon;
+		for (std::string* v : {&action, &gname, &sec, &boon}) mymod_trimTail(*v, "\n\r \t");
 		if (!sec.empty()) {
 			size_t colon = sec.find(":");
 			if (colon != std::string::npos) {
@@ -337,10 +493,140 @@ void mymod_sendToFollower(const std::string& says) {
 				mymod_herx_informant = (uint32_t)strtoul(sec.substr(colon+1).c_str(), nullptr, 10);
 			}
 		}
-		{ std::lock_guard<std::mutex> lock(mymod_ai_mutex); mymod_ai_reply = speech; mymod_ai_action = action; mymod_ai_name = gname; }
-		mymod_ai_ready.store(true);
+		{
+			std::lock_guard<std::mutex> lock(c.mutex);
+			c.reply = speech; c.action = action; c.name = gname; c.boon = boon;
+		}
+		c.ready.store(true);
 	}).detach();
 }
+
+// Local entry point: /aicommand and the voice bridge both land here.
+// On a client this becomes a packet; the host never runs a second AI backend.
+void mymod_sendToFollower(const std::string& says) {
+	if (says.empty()) return;
+	if (multiplayer == CLIENT) {
+		// No local "waiting" latch: the HOST is authoritative about whether this player is
+		// mid-generation, and its refusal ("still waiting on previous reply...") already
+		// relays back over MSGS. A latch here could only ever get out of sync with it.
+		// All we owe the host is not flooding the wire.
+		static uint32_t lastSend = 0;
+		if (lastSend != 0 && ticks - lastSend < MYMOD_CLIENT_SEND_COOLDOWN) return;
+		lastSend = ticks;
+		mymod_netSendSays(says);
+		return;
+	}
+	mymod_requestFromPlayer(clientnum, says);
+}
+
+// =============================================================================
+//  DELIVERY
+// =============================================================================
+
+// Fan a line out to every player: chat for all, bubble for all. On the host,
+// messagePlayerColor() and createDialogueTooltip() emit the vanilla MSGS/BUBL packets
+// for remote players themselves, so this one loop reaches the whole party.
+static void mymod_broadcastLine(uint32_t speakerUID, const std::string& prefix, const std::string& text) {
+	for (int c = 0; c < MAXPLAYERS; ++c) {
+		if (client_disconnected[c] || !players[c]) continue;
+		messagePlayerColor(c, MESSAGE_CHAT, makeColorRGB(180, 220, 255), "%s%s",
+			prefix.c_str(), text.c_str());
+		if (speakerUID != 0) {
+			// "%s" as the format string guards against stray % in AI text (printf-style).
+			players[c]->worldUI.worldTooltipDialogue.createDialogueTooltip(
+				speakerUID, Player::WorldUI_t::WorldTooltipDialogue_t::DIALOGUE_NPC,
+				"%s", text.c_str());
+		}
+	}
+}
+
+// Apply one finished generation: boon, rename, broadcast, then the follower command.
+static void mymod_deliverSlot(int slot) {
+	MymodConvo& cv = mymod_convo[slot];
+	if (!cv.ready.load()) return;
+	std::string reply, action, gname, boon;
+	{
+		std::lock_guard<std::mutex> lock(cv.mutex);
+		reply = cv.reply; action = cv.action; gname = cv.name; boon = cv.boon;
+	}
+	cv.ready.store(false);
+	cv.inflight.store(false);
+	cv.name.clear();
+	cv.boon.clear();
+
+	const bool isWorld = (slot == MYMOD_WORLD_SLOT);
+	const int pnum = isWorld ? clientnum : slot;
+	Entity* follower = (cv.follower_uid != 0) ? uidToEntity(cv.follower_uid) : nullptr;
+
+	if (!boon.empty() && follower) {
+		mymod_applyBoon(boon, follower);
+	}
+	// Set the follower's given name (renames the party HUD; GameUI reads Stat->name).
+	if (follower && !gname.empty() && follower->getStats()
+		&& strcmp(follower->getStats()->name, gname.c_str()) != 0) {
+		strncpy(follower->getStats()->name, gname.c_str(), 127);
+		follower->getStats()->name[127] = '\0';
+		mymod_netBroadcastName(cv.follower_uid, gname);   // clients keep their own copy
+	}
+
+	// Chat label. In co-op a shared feed needs to say whose follower is speaking;
+	// singleplayer keeps the bare line it has always had.
+	std::string prefix = cv.prefix;
+	if (!isWorld && multiplayer != SINGLE) {
+		const char* owner = (stats[pnum] && stats[pnum]->name[0]) ? stats[pnum]->name : "someone";
+		std::string who = gname;
+		if (who.empty() && follower && follower->getStats() && follower->getStats()->name[0]) {
+			who = follower->getStats()->name;
+		}
+		if (who.empty() && follower) who = getMonsterLocalizedName(follower->getRace());
+		char buf[192];
+		snprintf(buf, sizeof(buf), "%s's %s: ", owner, who.empty() ? "follower" : who.c_str());
+		prefix = buf;
+	}
+	mymod_broadcastLine(cv.speaker_uid, prefix, reply);
+	cv.prefix.clear();
+	cv.speaker_uid = 0;
+
+	if (isWorld) { cv.follower_uid = 0; return; }
+
+	// Execute the follower command for the player who asked.
+	if (cv.follower_uid != 0 && !action.empty() && action != "NONE") {
+		if (follower) {
+			if (action == "ATTACK") {
+				// Ask the GAME whether attack is even allowed for this follower at that
+				// player's skill. DIEGETIC ONLY: programmatic target-attack needs cursor-aim,
+				// and Barony's combat AI already auto-engages hostiles.
+				int skillLVL = 0;
+				if (stats[pnum] && players[pnum] && players[pnum]->entity) {
+					skillLVL = stats[pnum]->getModifiedProficiency(PRO_LEADERSHIP)
+						+ statGetCHR(stats[pnum], players[pnum]->entity);
+				}
+				int attackDisabled = FollowerMenu[pnum].optionDisabledForCreature(
+					skillLVL, follower->getStats()->type, ALLY_CMD_ATTACK_CONFIRM, follower);
+				if (attackDisabled != 0) {
+					printlog("[MYMOD] (player %d's follower can't take attack orders yet - leadership too low)", pnum);
+				} else {
+					printlog("[MYMOD] -> player %d's follower will engage nearby foes", pnum);
+				}
+			} else {
+				int cmd = -1;
+				if (action == "FOLLOW") cmd = ALLY_CMD_FOLLOW;
+				else if (action == "DEFEND" || action == "WAIT") cmd = ALLY_CMD_DEFEND;
+				if (cmd >= 0) {
+					follower->monsterAllySendCommand(cmd, 0, 0);
+					printlog("[MYMOD] -> player %d executed %s", pnum, action.c_str());
+				}
+			}
+		} else {
+			messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] follower gone, command skipped");
+		}
+	}
+	cv.follower_uid = 0;
+}
+
+// =============================================================================
+//  SETUP + EVENTS
+// =============================================================================
 
 // Load the saved AI server URL once at startup (persists /aiserver across restarts).
 void mymod_loadServerConfig() {
@@ -352,7 +638,7 @@ void mymod_loadServerConfig() {
 		char buf[512];
 		if (fgets(buf, sizeof(buf), cf)) {
 			std::string s(buf);
-			while (!s.empty() && (s.back()=='\n'||s.back()=='\r'||s.back()==' ')) s.pop_back();
+			mymod_trimTail(s, "\n\r ");
 			if (!s.empty()) mymod_ai_server = s;
 		}
 		fclose(cf);
@@ -360,19 +646,26 @@ void mymod_loadServerConfig() {
 }
 
 // Fire-and-forget event record: tell the AI service that something happened (recruitment, etc.).
-// No reply expected. Callable cross-file (declared extern in other TUs).
+// HOST ONLY — clients run this code path too (physfsLoadMapFile, actmonster) and must not
+// reach the service; in particular a client firing "new_run" would wipe the host's run state.
 void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor) {
+	if (!mymod_isHost()) return;
 	std::string t = etype ? etype : "";
 	std::string r = getMonsterLocalizedName((Monster)raceEnum);
 	if (r.empty()) r = "monster";
+	int owner = 0;
+	if (uid) {
+		int o = mymod_ownerOf(uidToEntity(uid));
+		if (o >= 0) owner = o;
+	}
 	uint32_t u = uid;
 	int fl = floor;
 	std::string server = mymod_ai_server;
-	std::thread([t, r, u, fl, server]() {
+	std::thread([t, r, u, fl, owner, server]() {
 		FILE* pf = fopen("/tmp/mymod_event.json", "w");
 		if (pf) {
-			fprintf(pf, "{\"event\":\"%s\",\"race\":\"%s\",\"floor\":%d,\"uid\":%u}",
-				t.c_str(), r.c_str(), fl, (unsigned)u);
+			fprintf(pf, "{\"event\":\"%s\",\"race\":\"%s\",\"floor\":%d,\"uid\":%u,\"player\":%d}",
+				t.c_str(), r.c_str(), fl, (unsigned)u, owner);
 			fclose(pf);
 		}
 		char cmd[512];
@@ -384,101 +677,47 @@ void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor)
 	}).detach();
 }
 
+// /aitest — debug ping at the nearest monster, host-side only (it bypasses follower state).
+void mymod_debugPing() {
+	if (!mymod_isHost()) {
+		messagePlayer(clientnum, MESSAGE_MISC, "[MYMOD] /aitest is host-only (the host owns the AI backend)");
+		return;
+	}
+	if (!players[clientnum] || !players[clientnum]->entity || !map.entities) return;
+	MymodConvo& cv = mymod_convo[MYMOD_WORLD_SLOT];
+	if (cv.inflight.load()) { messagePlayer(clientnum, MESSAGE_MISC, "[MYMOD] still waiting on previous reply..."); return; }
+	Entity* pl = players[clientnum]->entity;
+	Entity* nearest = nullptr;
+	double bestDist = 1e18;
+	for (auto node = map.entities->first; node != NULL; node = node->next) {
+		auto entity = (Entity*)node->element;
+		if (entity->behavior == &actMonster && entity != pl) {
+			double dx = entity->x - pl->x, dy = entity->y - pl->y;
+			double d = dx*dx + dy*dy;
+			if (d < bestDist) { bestDist = d; nearest = entity; }
+		}
+	}
+	if (!nearest) { messagePlayer(clientnum, MESSAGE_MISC, "[MYMOD] no monster nearby"); return; }
+	std::string raceName = getMonsterLocalizedName(nearest->getRace());
+	printlog("[MYMOD] %s (floor %d) is thinking...", raceName.c_str(), currentlevel);
+	cv.prefix = "[test] ";
+	cv.speaker_uid = nearest->getUID();
+	char payload[512];
+	snprintf(payload, sizeof(payload), "{\"race\":\"%s\",\"floor\":%d}", raceName.c_str(), currentlevel);
+	mymod_asyncAmbient(payload);
+}
+
 // ---- MYMOD: global-scope poll (outside ConsoleCommands namespace) ----
-// Called every frame from gameLogic() on the main thread.
+// Called every frame from gameLogic() on the main thread. gameLogic() runs on hosts AND
+// clients, so everything that touches the AI service is gated to the host here.
 void mymod_pollAI() {
 	mymod_loadServerConfig();
 	mymod_pollPTT();
+	if (!mymod_isHost()) {
+		return;   // clients receive dialogue as vanilla MSGS/BUBL packets; nothing to poll
+	}
 	mymod_ambientTick();
-	if (mymod_ai_ready.load()) {
-		std::string reply;
-		{
-			std::lock_guard<std::mutex> lock(mymod_ai_mutex);
-			reply = mymod_ai_reply;
-		}
-		std::string action;
-		{
-			std::lock_guard<std::mutex> lock(mymod_ai_mutex);
-			action = mymod_ai_action;
-		}
-		mymod_ai_ready.store(false);
-		mymod_ai_inflight.store(false);
-		if (!mymod_ambient_label.empty()) {
-			mymod_chat_prefix = mymod_ambient_label + " ";
-			mymod_ambient_label.clear();
-		} else {
-			mymod_chat_prefix.clear();
-		}
-		// Speech bubble over the speaker's head (follower reply OR ambient/taunt speaker).
-		// "%s" as the format string guards against stray % in AI text (variadic/printf-style).
-		{
-			if (!mymod_ai_boon.empty() && mymod_ai_follower_uid != 0) {
-				Entity* bg = uidToEntity(mymod_ai_follower_uid);
-				mymod_applyBoon(mymod_ai_boon, bg);
-				mymod_ai_boon.clear();
-			}
-			// Set the follower's given name if the service returned one (renames the party HUD).
-			if (mymod_ai_follower_uid != 0 && !mymod_ai_name.empty()) {
-				Entity* nf = uidToEntity(mymod_ai_follower_uid);
-				if (nf && nf->getStats() && strcmp(nf->getStats()->name, mymod_ai_name.c_str()) != 0) {
-					strncpy(nf->getStats()->name, mymod_ai_name.c_str(), 127);
-					nf->getStats()->name[127] = '\0';
-				}
-			}
-			uint32_t bubbleUID = (mymod_ai_follower_uid != 0) ? mymod_ai_follower_uid : mymod_ambient_speaker_uid;
-			if (bubbleUID != 0 && players[clientnum]) {
-				Entity* spk = uidToEntity(bubbleUID);
-				if (spk) {
-					players[clientnum]->worldUI.worldTooltipDialogue.createDialogueTooltip(
-						spk->getUID(), Player::WorldUI_t::WorldTooltipDialogue_t::DIALOGUE_NPC,
-						"%s", reply.c_str());
-				}
-			}
-			mymod_ambient_speaker_uid = 0;  // consumed
-		}
-		// Also post to the scrollable text chat as the permanent, reviewable record.
-		// Broadcast AI dialogue to ALL active local players' chat feeds (shared, distance-independent).
-		// Stage 1: local/split-screen only — no netcode. Networked broadcast to remote clients is Stage 2.
-		for (int mp_c = 0; mp_c < MAXPLAYERS; ++mp_c) {
-			if (!client_disconnected[mp_c] && players[mp_c] && players[mp_c]->isLocalPlayer()) {
-				messagePlayerColor(mp_c, MESSAGE_CHAT, makeColorRGB(180, 220, 255), "%s%s", mymod_chat_prefix.c_str(), reply.c_str());
-			}
-		}
-		// If a follower command was requested, re-resolve the follower by UID and fire it.
-		if (mymod_ai_follower_uid != 0 && !action.empty() && action != "NONE") {
-			Entity* follower = uidToEntity(mymod_ai_follower_uid);
-			if (follower) {
-				if (action == "ATTACK") {
-					// Ask the GAME whether attack is even allowed for this follower at the player's skill.
-					int skillLVL = 0;
-					if (stats[clientnum]) {
-						skillLVL = stats[clientnum]->getModifiedProficiency(PRO_LEADERSHIP)
-							+ statGetCHR(stats[clientnum], players[clientnum]->entity);
-					}
-					int attackDisabled = FollowerMenu[clientnum].optionDisabledForCreature(
-						skillLVL, follower->getStats()->type, ALLY_CMD_ATTACK_CONFIRM, follower);
-					// DIEGETIC ATTACK: programmatic target-attack needs cursor-aim (out of scope).
-					// Followers already auto-engage hostiles via Barony's own combat AI, so we just
-					// acknowledge the order in character; the game does the actual fighting.
-					if (attackDisabled != 0) {
-						printlog("[MYMOD] (follower can't take attack orders yet - leadership too low)");
-					} else {
-						printlog("[MYMOD] -> follower will engage nearby foes");
-					}
-				} else {
-					int cmd = -1;
-					if (action == "FOLLOW") cmd = ALLY_CMD_FOLLOW;
-					else if (action == "DEFEND" || action == "WAIT") cmd = ALLY_CMD_DEFEND;
-					if (cmd >= 0) {
-						follower->monsterAllySendCommand(cmd, 0, 0);
-						printlog("[MYMOD] -> executed %s", action.c_str());
-					}
-				}
-			} else {
-				messagePlayer(clientnum, MESSAGE_MISC, "[MYMOD] follower gone, command skipped");
-			}
-			mymod_ai_follower_uid = 0;
-		}
+	for (int slot = 0; slot < MYMOD_MAX_SLOTS; ++slot) {
+		mymod_deliverSlot(slot);
 	}
 }
-

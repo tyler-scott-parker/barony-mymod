@@ -38,6 +38,7 @@
 #include "lobbies.hpp"
 #include "ui/MainMenu.hpp"
 #include "ui/LoadingScreen.hpp"
+#include "mymod/mymod.hpp"  // MYMOD: AI-NPC packet handlers
 #include "ui/GameUI.hpp"
 #include "interface/ui.hpp"
 #ifdef USE_PLAYFAB
@@ -6322,6 +6323,9 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 		}
 	}},
 
+	// MYMOD: a follower named itself; keep the client's copy in sync for the party HUD
+	{'MYNM', [](){ mymod_netClientRecvName(); }},
+
 	// text bubbles
 	{'BUBL', []() {
 		Uint32 uid = SDLNet_Read32(&net_packet->data[4]);
@@ -7660,6 +7664,9 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 			}
 		}
 	}},
+
+	// MYMOD: a client spoke to their follower; the HOST owns all AI compute
+	{'MYAI', [](){ mymod_netServerRecvSays(); }},
 
 	// message
 	{'MSGS', [](){
