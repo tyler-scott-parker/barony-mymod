@@ -754,6 +754,12 @@ void Entity::updateEntityOnHit(Entity* attacker, bool alertTarget)
 	if ( !attacker ) return;
 	if ( attacker == this ) { return; }
 
+	// MYMOD: did the player just strike one of their own followers?
+	{
+		extern void mymod_onFollowerHitByPlayer(Entity* victim, Entity* attacker);
+		mymod_onFollowerHitByPlayer(this, attacker);
+	}
+
 	if ( Stat* myStats = getStats() )
 	{
 		if ( Uint8 effectStrength = myStats->getEffectActive(EFF_PENANCE) )

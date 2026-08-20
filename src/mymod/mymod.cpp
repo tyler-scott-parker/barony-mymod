@@ -83,6 +83,35 @@ static std::map<uint32_t, uint32_t> mymod_taunt_cooldowns; // enemy uid -> last 
 static std::map<uint32_t, bool>     mymod_inCombat;        // follower uid -> was in combat last check
 static std::map<uint32_t, uint32_t> mymod_fightCooldown;   // follower uid -> last fought_alongside tick
 
+// ---- Watching what actually happens to a player's followers -------------------
+// Until this existed, nothing in a real run could raise fear or resentment except the
+// player literally typing a threat, so the interesting relationship tensions were
+// unreachable in play. Everything here rides the follower scan that already runs every
+// frame, so only friendly fire needed a new upstream hook.
+struct MymodFollowerWatch {
+	int      lastHP   = -1;
+	int      maxHP    = 0;
+	int      owner    = -1;
+	int      raceEnum = 0;
+	uint32_t seenTick = 0;
+	uint32_t farSince = 0;   // when they first fell too far behind (0 = they are with you)
+	uint32_t lastWound = 0, lastHeal = 0, lastFar = 0;
+};
+static std::map<uint32_t, MymodFollowerWatch> mymod_watch;
+static int mymod_watchLevel = -1;   // watch map is per-floor; a level change is not a massacre
+
+static std::map<uint32_t, uint32_t> mymod_hurtCooldown;   // follower uid -> last hurt_by_player tick
+
+static const double   MYMOD_WOUND_FRACTION = 0.35;        // "nearly killed" threshold
+static const double   MYMOD_HEAL_FRACTION  = 0.15;        // HP jump that reads as a deliberate heal
+static const double   MYMOD_HEAL_RANGE_SQ  = (6.0*16) * (6.0*16);
+static const double   MYMOD_FAR_RANGE_SQ   = (25.0*16) * (25.0*16);
+static const uint32_t MYMOD_FAR_PATIENCE   = 25 * 50;     // 25s adrift before it counts as left behind
+static const uint32_t MYMOD_WOUND_COOLDOWN = 60 * 50;
+static const uint32_t MYMOD_HEAL_COOLDOWN  = 30 * 50;
+static const uint32_t MYMOD_FAR_COOLDOWN   = 120 * 50;
+static const uint32_t MYMOD_HURT_COOLDOWN  = 10 * 50;     // a flurry of swings is ONE grievance
+
 // Are we the machine that owns world state and talks to the AI service?
 static inline bool mymod_isHost() { return multiplayer != CLIENT; }
 
@@ -328,6 +357,51 @@ void mymod_ambientTick() {
 			if (!fes) continue;
 			uint32_t fuid = fe->getUID();
 			if (fes->HP <= 0) { mymod_inCombat[fuid] = false; continue; }
+
+			// --- what has happened to this follower since last frame ---
+			MymodFollowerWatch& w = mymod_watch[fuid];
+			w.owner = owner;
+			w.raceEnum = (int)fe->getRace();
+			w.maxHP = fes->MAXHP;
+			w.seenTick = ticks;
+			if (w.lastHP >= 0 && fes->MAXHP > 0) {
+				const int delta = fes->HP - w.lastHP;
+				// Nearly killed: crossing DOWN through the threshold, not sitting below it.
+				const double was = (double)w.lastHP / fes->MAXHP;
+				const double now = (double)fes->HP / fes->MAXHP;
+				if (was >= MYMOD_WOUND_FRACTION && now < MYMOD_WOUND_FRACTION
+					&& ticks - w.lastWound >= MYMOD_WOUND_COOLDOWN) {
+					w.lastWound = ticks;
+					mymod_recordEvent("wounded", fuid, w.raceEnum, currentlevel);
+				}
+				// A sharp jump upward next to their leader is a heal, not regeneration.
+				if (delta > 0 && (double)delta / fes->MAXHP >= MYMOD_HEAL_FRACTION
+					&& ticks - w.lastHeal >= MYMOD_HEAL_COOLDOWN
+					&& players[owner] && players[owner]->entity) {
+					double hx = fe->x - players[owner]->entity->x, hy = fe->y - players[owner]->entity->y;
+					if (hx*hx + hy*hy <= MYMOD_HEAL_RANGE_SQ) {
+						w.lastHeal = ticks;
+						mymod_recordEvent("healed_by_player", fuid, w.raceEnum, currentlevel);
+					}
+				}
+			}
+			w.lastHP = fes->HP;
+
+			// Left behind: adrift for a sustained stretch, not just briefly out of sight.
+			if (players[owner] && players[owner]->entity) {
+				double lx = fe->x - players[owner]->entity->x, ly = fe->y - players[owner]->entity->y;
+				if (lx*lx + ly*ly > MYMOD_FAR_RANGE_SQ) {
+					if (w.farSince == 0) { w.farSince = ticks; }
+					else if (ticks - w.farSince >= MYMOD_FAR_PATIENCE
+						&& ticks - w.lastFar >= MYMOD_FAR_COOLDOWN) {
+						w.lastFar = ticks;
+						mymod_recordEvent("left_behind", fuid, w.raceEnum, currentlevel);
+					}
+				} else {
+					w.farSince = 0;
+				}
+			}
+
 			bool inCombat = (fe->monsterState == MONSTER_STATE_ATTACK || fe->monsterState == MONSTER_STATE_HUNT);
 			bool wasInCombat = mymod_inCombat.count(fuid) ? mymod_inCombat[fuid] : false;
 			if (inCombat && !wasInCombat) { mymod_inCombat[fuid] = true; }
@@ -338,6 +412,29 @@ void mymod_ambientTick() {
 					mymod_fightCooldown[fuid] = ticks;
 					mymod_recordEvent("fought_alongside", fuid, (int)fe->getRace(), currentlevel);
 				}
+			}
+		}
+	}
+	// Anyone we were watching who is no longer on the map died. Their surviving companions
+	// saw it. A LEVEL CHANGE also empties the map, so the watch is reset per floor rather
+	// than mistaking a staircase for a massacre.
+	if (!intro && map.entities) {
+		if (currentlevel != mymod_watchLevel) {
+			mymod_watchLevel = currentlevel;
+			mymod_watch.clear();
+		} else {
+			for (auto it = mymod_watch.begin(); it != mymod_watch.end(); ) {
+				if (it->second.seenTick == ticks) { ++it; continue; }
+				const int owner = it->second.owner;
+				// Tell this player's OTHER followers what they just watched happen.
+				for (auto& other : mymod_watch) {
+					if (other.first == it->first || other.second.owner != owner) continue;
+					if (other.second.seenTick != ticks) continue;   // only the living
+					mymod_recordEvent("ally_died", other.first, other.second.raceEnum, currentlevel);
+				}
+				printlog("[MYMOD] player %d's follower %u died; %s", owner, (unsigned)it->first,
+					"companions noted it");
+				it = mymod_watch.erase(it);
 			}
 		}
 	}
@@ -640,6 +737,24 @@ static void mymod_requestFromPlayer(int pnum, const std::string& says) {
 	mymod_requestFollower(pnum, says);
 }
 
+// HOST: the player struck their own follower. Called from Entity::updateEntityOnHit, which
+// is the game's central "I was hit by X" path and already knows the attacker.
+void mymod_onFollowerHitByPlayer(Entity* victim, Entity* attacker) {
+	if (!mymod_isHost() || !victim || !attacker) return;
+	if (victim->behavior != &actMonster || attacker->behavior != &actPlayer) return;
+	const int owner = mymod_ownerOf(victim);
+	if (owner < 0) return;
+	if (attacker->skill[2] != owner) return;   // only being hit by YOUR OWN leader is a betrayal
+	Stat* vs = victim->getStats();
+	if (!vs || vs->HP <= 0) return;
+	const uint32_t uid = victim->getUID();
+	uint32_t last = mymod_hurtCooldown.count(uid) ? mymod_hurtCooldown[uid] : 0;
+	if (last != 0 && ticks - last < MYMOD_HURT_COOLDOWN) return;
+	mymod_hurtCooldown[uid] = ticks;
+	mymod_recordEvent("hurt_by_player", uid, (int)victim->getRace(), currentlevel);
+	printlog("[MYMOD] player %d struck their own follower %u", owner, (unsigned)uid);
+}
+
 // HOST: a player engaged an NPC (clicked them). Make them the conversation partner and
 // have them say something. Called from handleMonsterChatter and from the shop-open path.
 // Returns TRUE only if an AI line is actually on its way. The caller falls back to the
@@ -834,6 +949,9 @@ void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor)
 	if (!mymod_isHost()) return;
 	if (etype && !strcmp(etype, "new_run")) {
 		for (int c = 0; c < MAXPLAYERS; ++c) { mymod_partner[c] = 0; mymod_shopLine[c].clear(); }
+		mymod_watch.clear();
+		mymod_hurtCooldown.clear();
+		mymod_watchLevel = -1;
 	}
 	std::string t = etype ? etype : "";
 	std::string r = getMonsterLocalizedName((Monster)raceEnum);

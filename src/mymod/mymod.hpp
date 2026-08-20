@@ -35,3 +35,4 @@ void mymod_netClientRecvShopLine();// 'MYSH'  host -> client: a merchant's line 
 // Called when a player engages an NPC: from handleMonsterChatter (clicking a talking NPC)
 // and from startTradingServer (opening a merchant's shop).
 bool mymod_npcEngage(int player, Entity* npc);   // true = an AI line is coming; false = use vanilla
+void mymod_onFollowerHitByPlayer(Entity* victim, Entity* attacker);  // friendly fire -> resentment
