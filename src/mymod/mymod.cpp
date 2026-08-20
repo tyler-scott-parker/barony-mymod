@@ -25,6 +25,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstdarg>
 #include <map>
 #include <unordered_map>
 #include <SDL.h>
@@ -59,6 +60,7 @@ struct MymodConvo {
 	std::string name;           // follower given-name ("" if none)
 	std::string boon;           // "item:TYPE:N" or "traps:" pending application
 	std::string prefix;         // chat-line label, e.g. "[taunt] " or "Ada's Grix: "
+	std::string ident;          // "1" = the identification was correct AND honest
 	uint32_t follower_uid = 0;  // who this slot is talking to (0 = world channel)
 	uint32_t speaker_uid = 0;   // whose head the bubble goes over
 	bool is_npc = false;        // conversation partner is a non-follower NPC, not a follower
@@ -182,6 +184,7 @@ void mymod_netServerRecvSays() {
 	const int pnum = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));
 	client_keepalive[pnum] = ticks;
 	std::string says((const char*)(&net_packet->data[5]));
+	mymod_log("net: MYAI from client p%d (%d bytes)", pnum, (int)says.size());
 	mymod_requestFromPlayer(pnum, says);
 }
 
@@ -289,7 +292,7 @@ static void mymod_applyBoon(const std::string& payload, Entity* giver) {
 	if (payload.empty()) return;
 	if (payload.rfind("traps:", 0) == 0) {
 		int n = mymod_disarmFloorTraps();
-		printlog("[MYMOD] follower disarmed %d trap(s) on this floor", n);
+		mymod_log("boon: follower disarmed %d trap(s) on floor %d", n, currentlevel);
 		return;
 	}
 	if (payload.rfind("item:", 0) == 0 && giver) {
@@ -304,7 +307,7 @@ static void mymod_applyBoon(const std::string& payload, Entity* giver) {
 		Item* it = newItem(*t, EXCELLENT, 0, (Sint16)count, 0, true, nullptr);
 		if (it) {
 			dropItemMonster(it, giver, giver->getStats(), (Sint16)count);
-			printlog("[MYMOD] follower gave boon item %s x%d", iname.c_str(), count);
+			mymod_log("boon: follower dropped %s x%d", iname.c_str(), count);
 		}
 	}
 }
@@ -449,8 +452,8 @@ void mymod_ambientTick() {
 					if (other.second.seenTick != ticks) continue;   // only the living
 					mymod_recordEvent("ally_died", other.first, other.second.raceEnum, currentlevel);
 				}
-				printlog("[MYMOD] player %d's follower %u died; %s", owner, (unsigned)it->first,
-					"companions noted it");
+				mymod_log("death: p%d's follower %u died; companions noted it",
+					owner, (unsigned)it->first);
 				it = mymod_watch.erase(it);
 			}
 		}
@@ -656,7 +659,7 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 		char cmd[1536];
 		snprintf(cmd, sizeof(cmd),
 			"curl -s %s -X POST -H 'Content-Type: application/json' --data @%s > %s 2>/dev/null; "
-			"python3 -c 'import json;d=json.load(open(\"%s\"));print(d.get(\"reply\",\"\"));print(\"::ACTION::\"+d.get(\"action\",\"NONE\"));print(\"::NAME::\"+d.get(\"name\",\"\"));print(\"::SECRET::\"+d.get(\"secret\",\"\"));print(\"::BOON::\"+d.get(\"boon\",\"\"))'",
+			"python3 -c 'import json;d=json.load(open(\"%s\"));print(d.get(\"reply\",\"\"));print(\"::ACTION::\"+d.get(\"action\",\"NONE\"));print(\"::NAME::\"+d.get(\"name\",\"\"));print(\"::SECRET::\"+d.get(\"secret\",\"\"));print(\"::BOON::\"+d.get(\"boon\",\"\"));print(\"::IDENT::\"+d.get(\"identify\",\"0\"))'",
 			server.c_str(), payloadPath, replyPath, replyPath);
 		FILE* pipe = popen(cmd, "r");
 		std::string out;
@@ -675,7 +678,11 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 		if (smark != std::string::npos) { sec = gname.substr(smark + 10); gname = gname.substr(0, smark); }
 		size_t bmark = sec.find("::BOON::");
 		if (bmark != std::string::npos) { boon = sec.substr(bmark + 8); sec = sec.substr(0, bmark); }
-		for (std::string* v : {&action, &gname, &sec, &boon}) mymod_trimTail(*v, "\n\r \t");
+		std::string ident;
+		size_t imark = boon.find("::IDENT::");
+		if (imark != std::string::npos) { ident = boon.substr(imark + 9); boon = boon.substr(0, imark); }
+		for (std::string* v : {&action, &gname, &sec, &boon, &ident}) mymod_trimTail(*v, "\n\r \t");
+		c.ident = ident;
 		if (!sec.empty()) {
 			size_t colon = sec.find(":");
 			if (colon != std::string::npos) {
@@ -703,6 +710,95 @@ static std::string mymod_payloadHead(int pnum, const std::string& raceName, uint
 		mymod_jsonEscape(says).c_str(), (unsigned)uid,
 		pnum, mymod_jsonEscape(playerName).c_str());
 	return std::string(buf);
+}
+
+// ---- Item identification as a social reward (spec 9) -------------------------
+// The ENGINE stays authoritative about what an item is; the service decides only what the
+// follower CLAIMS. A truthful claim sets item->identified here, a lie or an honest mistake
+// leaves the item exactly as it was -- so being lied to costs you something real later.
+//
+// LOCAL PLAYER ONLY for now. A remote client owns its own inventory display, and vanilla
+// pointedly refuses to touch a client's items server-side (see items.cpp:3867), so routing
+// this over the wire needs item info in MYAI and a verdict packet back. Not done yet.
+static const char* MYMOD_CATEGORY_NAMES[] = {
+	"weapon", "armor", "amulet", "potion", "scroll", "magicstaff", "ring", "spellbook",
+	"gem", "thrown", "tool", "food", "book", "spell", "tome",
+};
+static Uint32 mymod_identItem[MAXPLAYERS] = { 0 };   // item awaiting a verdict, per player
+
+// The nth (1-based) unidentified item in this player's inventory.
+static Item* mymod_findUnidentified(int pnum, int nth) {
+	if (!stats[pnum]) return nullptr;
+	int seen = 0;
+	for (node_t* n = stats[pnum]->inventory.first; n != NULL; n = n->next) {
+		Item* it = (Item*)n->element;
+		if (!it || it->identified) continue;
+		if (++seen >= nth) return it;
+	}
+	return nullptr;
+}
+
+// Three other real item names from the SAME category, for the service to lie or err with.
+// Choosing them here keeps invented item names out of the model's hands.
+static std::string mymod_identDecoys(Item* it) {
+	std::vector<std::string> pool;
+	const Category cat = items[it->type].category;
+	for (int t = 0; t < NUMITEMS; ++t) {
+		if (t == (int)it->type) continue;
+		if (items[t].category != cat) continue;
+		const char* nm = items[t].getIdentifiedName();
+		if (nm && nm[0] && strcmp(nm, "nothing")) pool.push_back(nm);
+	}
+	std::string out = "[";
+	for (int k = 0; k < 3 && !pool.empty(); ++k) {
+		size_t pick = rand() % pool.size();
+		if (k) out += ",";
+		out += "\"" + mymod_jsonEscape(pool[pick]) + "\"";
+		pool.erase(pool.begin() + pick);
+	}
+	return out + "]";
+}
+
+// HOST: ask this player's follower what an unidentified item is.
+void mymod_identifyRequest(int pnum, int nth) {
+	if (!mymod_isHost()) {
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] /aiidentify is host-only for now");
+		return;
+	}
+	if (pnum < 0 || pnum >= MAXPLAYERS) return;
+	if (mymod_convo[pnum].inflight.load()) {
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] still waiting on previous reply...");
+		return;
+	}
+	Item* it = mymod_findUnidentified(pnum, nth < 1 ? 1 : nth);
+	if (!it) {
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] you have no unidentified item number %d", nth < 1 ? 1 : nth);
+		return;
+	}
+	Entity* follower = mymod_findFollower(pnum);
+	if (!follower) {
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] nobody of yours nearby to ask");
+		return;
+	}
+	const Category cat = items[it->type].category;
+	const char* catName = (cat >= 0 && cat < CATEGORY_MAX) ? MYMOD_CATEGORY_NAMES[cat] : "thing";
+	// Show the player only the UNIDENTIFIED name -- asking must not spoil the answer.
+	const char* unid = items[it->type].getUnidentifiedName();
+	const char* real = items[it->type].getIdentifiedName();
+	messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] you hold out the %s...", unid ? unid : catName);
+
+	mymod_identItem[pnum] = it->uid;
+	std::string raceName = getMonsterLocalizedName(follower->getRace());
+	char tail[768];
+	snprintf(tail, sizeof(tail),
+		",\"party\":%d,\"identify\":{\"category\":\"%s\",\"real\":\"%s\",\"unid\":\"%s\",\"decoys\":%s}",
+		mymod_partySize(), catName,
+		mymod_jsonEscape(real ? real : "").c_str(),
+		mymod_jsonEscape(unid ? unid : "").c_str(),
+		mymod_identDecoys(it).c_str());
+	std::string payload = "{" + mymod_payloadHead(pnum, raceName, follower->getUID(),
+		"what is this? can you tell me what I'm carrying?") + tail + "}";
+	mymod_fireRequest(pnum, payload, follower->getUID(), false, raceName.c_str());
 }
 
 // HOST: talk to a non-follower NPC. `greeting` is the line they volunteer when engaged.
@@ -769,7 +865,7 @@ void mymod_onFollowerHitByPlayer(Entity* victim, Entity* attacker) {
 	if (last != 0 && ticks - last < MYMOD_HURT_COOLDOWN) return;
 	mymod_hurtCooldown[uid] = ticks;
 	mymod_recordEvent("hurt_by_player", uid, (int)victim->getRace(), currentlevel);
-	printlog("[MYMOD] player %d struck their own follower %u", owner, (unsigned)uid);
+	mymod_log("friendly fire: p%d struck their own follower %u", owner, (unsigned)uid);
 }
 
 // Stop addressing an NPC and go back to your own follower. Without this the only way out of
@@ -831,6 +927,7 @@ bool mymod_npcEngage(int pnum, Entity* npc) {
 	mymod_partner[pnum] = npc->getUID();
 	if (mymod_convo[pnum].inflight.load()) return false;  // already mid-line; don't queue a second
 	if (!switching) return false;    // re-clicking your current partner: let vanilla chatter fill in
+	mymod_log("engage: p%d now talking to uid %u", pnum, (unsigned)npc->getUID());
 	mymod_requestNPC(pnum, npc, "", true);
 	return true;
 }
@@ -920,6 +1017,22 @@ static void mymod_deliverSlot(int slot) {
 	if (!boon.empty() && follower) {
 		mymod_applyBoon(boon, follower);
 	}
+	// Item identification: only a claim that was BOTH correct and honest actually identifies
+	// the item. A lie or an honest mistake leaves it exactly as it was, and the player finds
+	// out the hard way.
+	if (mymod_identItem[pnum] != 0) {
+		Item* it = uidToItem(mymod_identItem[pnum]);
+		std::string verdict;
+		{ std::lock_guard<std::mutex> lock(cv.mutex); verdict = cv.ident; }
+		if (it && verdict == "1" && !it->identified) {
+			it->identified = true;
+			it->notifyIcon = true;
+			mymod_log("identify: p%d item now identified as %s", pnum, it->getName());
+			messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] you are certain now: %s", it->getName());
+		}
+		mymod_identItem[pnum] = 0;
+		cv.ident.clear();
+	}
 	// Set the follower's given name (renames the party HUD; GameUI reads Stat->name).
 	if (follower && !gname.empty() && follower->getStats()
 		&& strcmp(follower->getStats()->name, gname.c_str()) != 0) {
@@ -1002,6 +1115,48 @@ void mymod_loadServerConfig() {
 		}
 		fclose(cf);
 	}
+}
+
+// Push a line into the service's session timeline. Things that only the ENGINE knows -- a boon
+// actually landing, an item actually being identified, a packet arriving, the Herx debuff being
+// applied -- are invisible in the service's own log, and those are exactly the facts you need
+// when something looks wrong in a playthrough. printlog() as well, so the terminal still shows it.
+void mymod_log(const char* fmt, ...) {
+	char buf[512];
+	va_list ap;
+	va_start(ap, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, ap);
+	va_end(ap);
+	printlog("[MYMOD] %s", buf);
+	if (!mymod_isHost()) return;   // only the host talks to the service
+	std::string msg = mymod_jsonEscape(buf);
+	std::string server = mymod_ai_server;
+	int fl = currentlevel;
+	std::string mp = mymod_jsonEscape(map.name);
+	std::thread([msg, server, fl, mp]() {
+		FILE* pf = fopen("/tmp/mymod_log.json", "w");
+		if (pf) {
+			fprintf(pf, "{\"log\":\"%s\",\"src\":\"cpp\",\"floor\":%d,\"map\":\"%s\"}",
+				msg.c_str(), fl, mp.c_str());
+			fclose(pf);
+		}
+		char cmd[512];
+		snprintf(cmd, sizeof(cmd),
+			"curl -s %s -X POST -H 'Content-Type: application/json' --data @/tmp/mymod_log.json >/dev/null 2>&1",
+			server.c_str());
+		int rc = system(cmd); (void)rc;
+	}).detach();
+}
+
+// A note typed by the player mid-run ("/ailog bubble never appeared"). The single most useful
+// thing in a playtest log is the human saying where to look.
+void mymod_playerNote(int pnum, const std::string& text) {
+	if (text.empty()) {
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] usage: /ailog <what just went wrong>");
+		return;
+	}
+	mymod_log("NOTE (p%d): %s", pnum, text.c_str());
+	messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] noted in the session log");
 }
 
 // Fire-and-forget event record: tell the AI service that something happened (recruitment, etc.).

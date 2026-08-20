@@ -38,3 +38,8 @@ bool mymod_npcEngage(int player, Entity* npc);   // true = an AI line is coming;
 void mymod_onFollowerHitByPlayer(Entity* victim, Entity* attacker);  // friendly fire -> resentment
 void mymod_clearPartner(int player);   // stop addressing an NPC, go back to your follower
 void mymod_debugStatus(int player);    // /aistatus -- what the mod currently believes
+void mymod_identifyRequest(int player, int nth);  // /aiidentify -- spec 9, host-only for now
+
+// --- session logging: engine-only facts pushed into the service's timeline ---
+void mymod_log(const char* fmt, ...);
+void mymod_playerNote(int player, const std::string& text);   // /ailog <note>

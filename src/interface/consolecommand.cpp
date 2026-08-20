@@ -987,6 +987,17 @@ static ConsoleCommand ccmd_aicommand("/aicommand", "MYMOD: talk to your follower
 		mymod_debugStatus(clientnum);
 		});
 
+	static ConsoleCommand ccmd_ailog("/ailog", "MYMOD: note something odd into the session log", []CCMD{
+		std::string note;
+		for (int i = 1; i < argc; ++i) { if (i > 1) note += " "; note += argv[i]; }
+		mymod_playerNote(clientnum, note);
+		});
+
+	static ConsoleCommand ccmd_aiidentify("/aiidentify", "MYMOD: ask your follower what an unidentified item is", []CCMD{
+		if (!(svFlags & SV_FLAG_CHEATS)) { messagePlayer(clientnum, MESSAGE_MISC, Language::get(277)); return; }
+		mymod_identifyRequest(clientnum, argc > 1 ? atoi(argv[1]) : 1);
+		});
+
 	static ConsoleCommand ccmd_friendly("/friendly", "make all NPCs friendly (cheat)", []CCMD{
 		if (!(svFlags & SV_FLAG_CHEATS))
 		{
