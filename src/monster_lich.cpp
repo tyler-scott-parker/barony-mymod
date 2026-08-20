@@ -113,7 +113,10 @@ void initLich(Entity* my, Stat* myStats)
 						case 4: myStats->DEX = std::max(0, myStats->DEX - 4 * mult); break;
 						default: break;
 					}
-					printlog("[MYMOD] Herx debuff %d applied (tier %d): HP=%d STR=%d DEX=%d CON=%d",
+					// Into the session timeline, not just the terminal: this is the payoff of the
+					// entire Herx arc and the one moment you cannot go back and re-observe.
+					extern void mymod_log(const char* fmt, ...);
+					mymod_log("HERX: debuff %d applied (tier %d) HP=%d STR=%d DEX=%d CON=%d",
 						mymod_herx_debuff, mult, myStats->MAXHP, myStats->STR, myStats->DEX, myStats->CON);
 				}
 			}

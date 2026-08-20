@@ -1170,6 +1170,7 @@ static void mymod_deliverSlot(int slot) {
 		&& strcmp(follower->getStats()->name, gname.c_str()) != 0) {
 		strncpy(follower->getStats()->name, gname.c_str(), 127);
 		follower->getStats()->name[127] = '\0';
+		mymod_log("named: p%d's follower %u is now '%s'", pnum, (unsigned)cv.follower_uid, gname.c_str());
 		mymod_netBroadcastName(cv.follower_uid, gname);   // clients keep their own copy
 	}
 
@@ -1208,9 +1209,9 @@ static void mymod_deliverSlot(int slot) {
 				int attackDisabled = FollowerMenu[pnum].optionDisabledForCreature(
 					skillLVL, follower->getStats()->type, ALLY_CMD_ATTACK_CONFIRM, follower);
 				if (attackDisabled != 0) {
-					printlog("[MYMOD] (player %d's follower can't take attack orders yet - leadership too low)", pnum);
+					mymod_log("action: p%d ATTACK refused - leadership too low", pnum);
 				} else {
-					printlog("[MYMOD] -> player %d's follower will engage nearby foes", pnum);
+					mymod_log("action: p%d ATTACK acknowledged (diegetic)", pnum);
 				}
 			} else {
 				int cmd = -1;
@@ -1218,10 +1219,11 @@ static void mymod_deliverSlot(int slot) {
 				else if (action == "DEFEND" || action == "WAIT") cmd = ALLY_CMD_DEFEND;
 				if (cmd >= 0) {
 					follower->monsterAllySendCommand(cmd, 0, 0);
-					printlog("[MYMOD] -> player %d executed %s", pnum, action.c_str());
+					mymod_log("action: p%d executed %s", pnum, action.c_str());
 				}
 			}
 		} else {
+			mymod_log("action: p%d follower gone before %s could fire", pnum, action.c_str());
 			messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] follower gone, command skipped");
 		}
 	}
