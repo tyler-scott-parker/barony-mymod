@@ -6329,6 +6329,9 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 	// MYMOD: a merchant's AI line, for this client's own shop window
 	{'MYSH', [](){ mymod_netClientRecvShopLine(); }},
 
+	// MYMOD: verdict on an item this client asked its follower to identify
+	{'MYIV', [](){ mymod_netClientRecvIdentifyVerdict(); }},
+
 	// text bubbles
 	{'BUBL', []() {
 		Uint32 uid = SDLNet_Read32(&net_packet->data[4]);
@@ -7670,6 +7673,9 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 
 	// MYMOD: a client spoke to their follower; the HOST owns all AI compute
 	{'MYAI', [](){ mymod_netServerRecvSays(); }},
+
+	// MYMOD: a client is holding out an item for its follower to identify
+	{'MYID', [](){ mymod_netServerRecvIdentify(); }},
 
 	// message
 	{'MSGS', [](){

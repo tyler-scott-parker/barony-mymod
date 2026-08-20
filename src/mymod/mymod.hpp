@@ -30,6 +30,8 @@ bool mymod_busy(int player);                          // is this player mid-gene
 void mymod_netServerRecvSays();   // 'MYAI'  client -> host: "my player said X to their follower"
 void mymod_netClientRecvName();   // 'MYNM'  host -> client: a follower named itself
 void mymod_netClientRecvShopLine();// 'MYSH'  host -> client: a merchant's line for the shop window
+void mymod_netServerRecvIdentify();       // 'MYID'  client -> host: item it wants identified
+void mymod_netClientRecvIdentifyVerdict();// 'MYIV'  host -> client: was the claim true?
 
 // --- non-follower NPCs (townsfolk, merchants, named characters) ---
 // Called when a player engages an NPC: from handleMonsterChatter (clicking a talking NPC)

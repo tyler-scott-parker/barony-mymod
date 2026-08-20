@@ -759,20 +759,159 @@ static std::string mymod_identDecoys(Item* it) {
 	return out + "]";
 }
 
-// HOST: ask this player's follower what an unidentified item is.
-void mymod_identifyRequest(int pnum, int nth) {
-	if (!mymod_isHost()) {
-		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] /aiidentify is host-only for now");
-		return;
+// Which players are awaiting a verdict for an item they own on ANOTHER machine.
+static bool mymod_identRemote[MAXPLAYERS] = { false };
+
+// HOST: fire the identification request. The item metadata is passed in rather than looked up,
+// because for a remote client the item lives in THAT client's inventory, not ours.
+static void mymod_identifyFire(int pnum, Entity* follower, Uint32 itemUid, const char* catName,
+                               const char* real, const char* unid, const std::string& decoysJson,
+                               bool remote) {
+	mymod_identItem[pnum] = itemUid;
+	mymod_identRemote[pnum] = remote;
+	std::string raceName = getMonsterLocalizedName(follower->getRace());
+	char tail[768];
+	snprintf(tail, sizeof(tail),
+		",\"party\":%d,\"identify\":{\"category\":\"%s\",\"real\":\"%s\",\"unid\":\"%s\",\"decoys\":%s}",
+		mymod_partySize(), catName,
+		mymod_jsonEscape(real ? real : "").c_str(),
+		mymod_jsonEscape(unid ? unid : "").c_str(),
+		decoysJson.c_str());
+	std::string payload = "{" + mymod_payloadHead(pnum, raceName, follower->getUID(),
+		"what is this? can you tell me what I'm carrying?") + tail + "}";
+	mymod_fireRequest(pnum, payload, follower->getUID(), false, raceName.c_str());
+}
+
+// CLIENT -> host ('MYID'): "here is the item I am holding out, and what it really is."
+// The client supplies the metadata because only it can see its own inventory. It is describing
+// its OWN item, so a dishonest client could only mislead itself.
+static void mymod_netSendIdentify(Item* it, int nth) {
+	if (multiplayer != CLIENT || !net_packet || !net_packet->data || !it) return;
+	const Category cat = items[it->type].category;
+	const char* catName = (cat >= 0 && cat < CATEGORY_MAX) ? MYMOD_CATEGORY_NAMES[cat] : "thing";
+	const char* unid = items[it->type].getUnidentifiedName();
+	const char* real = items[it->type].getIdentifiedName();
+
+	// Decoys as plain strings here; the host re-wraps them as JSON.
+	std::vector<std::string> decoys;
+	{
+		std::vector<std::string> pool;
+		for (int t = 0; t < NUMITEMS; ++t) {
+			if (t == (int)it->type || items[t].category != cat) continue;
+			const char* nm = items[t].getIdentifiedName();
+			if (nm && nm[0] && strcmp(nm, "nothing")) pool.push_back(nm);
+		}
+		for (int k = 0; k < 3 && !pool.empty(); ++k) {
+			size_t pick = rand() % pool.size();
+			decoys.push_back(pool[pick]);
+			pool.erase(pool.begin() + pick);
+		}
 	}
-	if (pnum < 0 || pnum >= MAXPLAYERS) return;
+	strcpy((char*)net_packet->data, "MYID");
+	net_packet->data[4] = (Uint8)clientnum;
+	SDLNet_Write32(it->uid, &net_packet->data[5]);
+	net_packet->data[9] = (Uint8)decoys.size();
+	size_t off = 10;
+	auto put = [&](const char* s) {
+		char tmp[64];
+		strncpy(tmp, s ? s : "", sizeof(tmp) - 1); tmp[sizeof(tmp) - 1] = '\0';
+		size_t len = strlen(tmp);
+		if (off + len + 1 >= NET_PACKET_SIZE) { tmp[0] = '\0'; len = 0; }
+		strcpy((char*)(&net_packet->data[off]), tmp);
+		off += len + 1;
+	};
+	put(catName); put(real); put(unid);
+	for (auto& d : decoys) put(d.c_str());
+	net_packet->address.host = net_server.host;
+	net_packet->address.port = net_server.port;
+	net_packet->len = (int)off;
+	sendPacketSafe(net_sock, -1, net_packet, 0);
+}
+
+// HOST handler for 'MYID'.
+void mymod_netServerRecvIdentify() {
+	const int pnum = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));
+	client_keepalive[pnum] = ticks;
 	if (mymod_convo[pnum].inflight.load()) {
 		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] still waiting on previous reply...");
 		return;
 	}
-	Item* it = mymod_findUnidentified(pnum, nth < 1 ? 1 : nth);
+	Uint32 itemUid = SDLNet_Read32(&net_packet->data[5]);
+	int nd = net_packet->data[9];
+	if (nd < 0 || nd > 3) nd = 0;
+	size_t off = 10;
+	auto get = [&]() -> std::string {
+		if (off >= (size_t)net_packet->len) return std::string();
+		std::string s((const char*)(&net_packet->data[off]));
+		off += s.size() + 1;
+		return s;
+	};
+	std::string catName = get(), real = get(), unid = get();
+	std::string decoysJson = "[";
+	for (int k = 0; k < nd; ++k) {
+		std::string d = get();
+		if (d.empty()) continue;
+		if (decoysJson.size() > 1) decoysJson += ",";
+		decoysJson += "\"" + mymod_jsonEscape(d) + "\"";
+	}
+	decoysJson += "]";
+	Entity* follower = mymod_findFollower(pnum);
+	if (!follower) {
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] nobody of yours nearby to ask");
+		return;
+	}
+	mymod_log("identify: client p%d asked about item %u (%s)", pnum, (unsigned)itemUid, unid.c_str());
+	mymod_identifyFire(pnum, follower, itemUid, catName.c_str(), real.c_str(), unid.c_str(),
+		decoysJson, true);
+}
+
+// HOST -> client ('MYIV'): the verdict. Only a correct AND honest claim identifies the item.
+static void mymod_netSendIdentifyVerdict(int pnum, Uint32 itemUid, bool identified) {
+	if (multiplayer != SERVER || !net_packet || !net_packet->data) return;
+	if (pnum <= 0 || pnum >= MAXPLAYERS) return;
+	if (client_disconnected[pnum] || players[pnum]->isLocalPlayer()) return;
+	strcpy((char*)net_packet->data, "MYIV");
+	SDLNet_Write32(itemUid, &net_packet->data[4]);
+	net_packet->data[8] = identified ? 1 : 0;
+	net_packet->address.host = net_clients[pnum - 1].host;
+	net_packet->address.port = net_clients[pnum - 1].port;
+	net_packet->len = 9;
+	sendPacketSafe(net_sock, -1, net_packet, pnum - 1);
+}
+
+// CLIENT handler for 'MYIV': apply the verdict to our own item.
+void mymod_netClientRecvIdentifyVerdict() {
+	Uint32 itemUid = SDLNet_Read32(&net_packet->data[4]);
+	if (!net_packet->data[8]) return;          // they were wrong or lying; item stays unknown
+	Item* it = uidToItem(itemUid);
+	if (it && !it->identified) {
+		it->identified = true;
+		it->notifyIcon = true;
+		messagePlayer(clientnum, MESSAGE_MISC, "[MYMOD] you are certain now: %s", it->getName());
+	}
+}
+
+// Ask your follower what an unidentified item is. Runs on whichever machine typed it: a client
+// resolves the item from its OWN inventory and ships the description to the host, because
+// vanilla pointedly refuses to touch a client's items server-side (items.cpp:3867).
+void mymod_identifyRequest(int pnum, int nth) {
+	if (pnum < 0 || pnum >= MAXPLAYERS) return;
+	if (nth < 1) nth = 1;
+	if (mymod_isHost() && mymod_convo[pnum].inflight.load()) {
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] still waiting on previous reply...");
+		return;
+	}
+	Item* it = mymod_findUnidentified(pnum, nth);
 	if (!it) {
-		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] you have no unidentified item number %d", nth < 1 ? 1 : nth);
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] you have no unidentified item number %d", nth);
+		return;
+	}
+	// Show only the UNIDENTIFIED name -- asking must not spoil the answer.
+	const char* unid = items[it->type].getUnidentifiedName();
+	messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] you hold out the %s...", unid ? unid : "thing");
+
+	if (multiplayer == CLIENT) {
+		mymod_netSendIdentify(it, nth);
 		return;
 	}
 	Entity* follower = mymod_findFollower(pnum);
@@ -782,23 +921,8 @@ void mymod_identifyRequest(int pnum, int nth) {
 	}
 	const Category cat = items[it->type].category;
 	const char* catName = (cat >= 0 && cat < CATEGORY_MAX) ? MYMOD_CATEGORY_NAMES[cat] : "thing";
-	// Show the player only the UNIDENTIFIED name -- asking must not spoil the answer.
-	const char* unid = items[it->type].getUnidentifiedName();
-	const char* real = items[it->type].getIdentifiedName();
-	messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] you hold out the %s...", unid ? unid : catName);
-
-	mymod_identItem[pnum] = it->uid;
-	std::string raceName = getMonsterLocalizedName(follower->getRace());
-	char tail[768];
-	snprintf(tail, sizeof(tail),
-		",\"party\":%d,\"identify\":{\"category\":\"%s\",\"real\":\"%s\",\"unid\":\"%s\",\"decoys\":%s}",
-		mymod_partySize(), catName,
-		mymod_jsonEscape(real ? real : "").c_str(),
-		mymod_jsonEscape(unid ? unid : "").c_str(),
-		mymod_identDecoys(it).c_str());
-	std::string payload = "{" + mymod_payloadHead(pnum, raceName, follower->getUID(),
-		"what is this? can you tell me what I'm carrying?") + tail + "}";
-	mymod_fireRequest(pnum, payload, follower->getUID(), false, raceName.c_str());
+	mymod_identifyFire(pnum, follower, it->uid, catName,
+		items[it->type].getIdentifiedName(), unid, mymod_identDecoys(it), false);
 }
 
 // HOST: talk to a non-follower NPC. `greeting` is the line they volunteer when engaged.
@@ -1021,16 +1145,24 @@ static void mymod_deliverSlot(int slot) {
 	// the item. A lie or an honest mistake leaves it exactly as it was, and the player finds
 	// out the hard way.
 	if (mymod_identItem[pnum] != 0) {
-		Item* it = uidToItem(mymod_identItem[pnum]);
 		std::string verdict;
 		{ std::lock_guard<std::mutex> lock(cv.mutex); verdict = cv.ident; }
-		if (it && verdict == "1" && !it->identified) {
-			it->identified = true;
-			it->notifyIcon = true;
-			mymod_log("identify: p%d item now identified as %s", pnum, it->getName());
-			messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] you are certain now: %s", it->getName());
+		const bool truthful = (verdict == "1");
+		if (mymod_identRemote[pnum]) {
+			// The item is in a client's inventory; only they can mark it.
+			mymod_netSendIdentifyVerdict(pnum, mymod_identItem[pnum], truthful);
+			mymod_log("identify: p%d (remote) verdict=%s", pnum, truthful ? "true" : "false");
+		} else {
+			Item* it = uidToItem(mymod_identItem[pnum]);
+			if (it && truthful && !it->identified) {
+				it->identified = true;
+				it->notifyIcon = true;
+				mymod_log("identify: p%d item now identified as %s", pnum, it->getName());
+				messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] you are certain now: %s", it->getName());
+			}
 		}
 		mymod_identItem[pnum] = 0;
+		mymod_identRemote[pnum] = false;
 		cv.ident.clear();
 	}
 	// Set the follower's given name (renames the party HUD; GameUI reads Stat->name).
