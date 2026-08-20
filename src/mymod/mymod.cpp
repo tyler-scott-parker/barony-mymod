@@ -360,21 +360,26 @@ void mymod_ambientTick() {
 
 			// --- what has happened to this follower since last frame ---
 			MymodFollowerWatch& w = mymod_watch[fuid];
+			const int prevMax = w.maxHP;          // capture BEFORE overwriting; see level-up guard
 			w.owner = owner;
 			w.raceEnum = (int)fe->getRace();
-			w.maxHP = fes->MAXHP;
 			w.seenTick = ticks;
-			if (w.lastHP >= 0 && fes->MAXHP > 0) {
+			// A LEVEL-UP raises MAXHP and restores HP. Without this guard that reads as a big
+			// heal, and the follower thanks the player for something they did not do.
+			const bool leveledUp = (prevMax > 0 && fes->MAXHP != prevMax);
+			if (w.lastHP >= 0 && fes->MAXHP > 0 && prevMax > 0 && !leveledUp) {
 				const int delta = fes->HP - w.lastHP;
 				// Nearly killed: crossing DOWN through the threshold, not sitting below it.
-				const double was = (double)w.lastHP / fes->MAXHP;
+				// Both sides use the SAME max, so a changed MAXHP cannot fake a crossing.
+				const double was = (double)w.lastHP / prevMax;
 				const double now = (double)fes->HP / fes->MAXHP;
 				if (was >= MYMOD_WOUND_FRACTION && now < MYMOD_WOUND_FRACTION
 					&& ticks - w.lastWound >= MYMOD_WOUND_COOLDOWN) {
 					w.lastWound = ticks;
 					mymod_recordEvent("wounded", fuid, w.raceEnum, currentlevel);
 				}
-				// A sharp jump upward next to their leader is a heal, not regeneration.
+				// A sharp jump upward next to their leader is a heal. Natural regeneration is
+				// gradual and cannot clear this in one frame.
 				if (delta > 0 && (double)delta / fes->MAXHP >= MYMOD_HEAL_FRACTION
 					&& ticks - w.lastHeal >= MYMOD_HEAL_COOLDOWN
 					&& players[owner] && players[owner]->entity) {
@@ -386,9 +391,16 @@ void mymod_ambientTick() {
 				}
 			}
 			w.lastHP = fes->HP;
+			w.maxHP = fes->MAXHP;
 
 			// Left behind: adrift for a sustained stretch, not just briefly out of sight.
-			if (players[owner] && players[owner]->entity) {
+			//
+			// ⚠ ONLY when they are following of their own accord. A follower told to hold
+			// position (ALLY_STATE_DEFEND) or sent somewhere (ALLY_STATE_MOVETO) is exactly
+			// where it was ordered to be -- and the mod's own DEFEND/WAIT action issues
+			// ALLY_CMD_DEFEND, so without this the player gets resented for being obeyed.
+			if (fe->monsterAllyState == ALLY_STATE_DEFAULT
+				&& players[owner] && players[owner]->entity) {
 				double lx = fe->x - players[owner]->entity->x, ly = fe->y - players[owner]->entity->y;
 				if (lx*lx + ly*ly > MYMOD_FAR_RANGE_SQ) {
 					if (w.farSince == 0) { w.farSince = ticks; }
@@ -425,6 +437,11 @@ void mymod_ambientTick() {
 		} else {
 			for (auto it = mymod_watch.begin(); it != mymod_watch.end(); ) {
 				if (it->second.seenTick == ticks) { ++it; continue; }
+				// Gone from the scan is not the same as dead. A follower who is DISMISSED, or
+				// whose leader changes, simply stops being anyone's follower and drops out of
+				// the loop above while still standing there. Only mourn a body that is really
+				// gone from the world.
+				if (uidToEntity(it->first) != nullptr) { it = mymod_watch.erase(it); continue; }
 				const int owner = it->second.owner;
 				// Tell this player's OTHER followers what they just watched happen.
 				for (auto& other : mymod_watch) {
@@ -753,6 +770,51 @@ void mymod_onFollowerHitByPlayer(Entity* victim, Entity* attacker) {
 	mymod_hurtCooldown[uid] = ticks;
 	mymod_recordEvent("hurt_by_player", uid, (int)victim->getRace(), currentlevel);
 	printlog("[MYMOD] player %d struck their own follower %u", owner, (unsigned)uid);
+}
+
+// Stop addressing an NPC and go back to your own follower. Without this the only way out of
+// a conversation was to walk 8 tiles off or click somebody else, which is not discoverable.
+void mymod_clearPartner(int pnum) {
+	if (pnum < 0 || pnum >= MAXPLAYERS) return;
+	if (mymod_partner[pnum] == 0) {
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] you are not talking to anyone in particular");
+		return;
+	}
+	Entity* npc = uidToEntity(mymod_partner[pnum]);
+	std::string who = "them";
+	if (npc && npc->getStats() && npc->getStats()->name[0]) who = npc->getStats()->name;
+	else if (npc) who = getMonsterLocalizedName(npc->getRace());
+	mymod_partner[pnum] = 0;
+	messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] you turn away from %s", who.c_str());
+}
+
+// Dump what the mod currently believes, so a playtest is diagnosable rather than guesswork.
+void mymod_debugStatus(int pnum) {
+	messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] map=\"%s\" floor=%d server=%s",
+		map.name, currentlevel, mymod_ai_server.c_str());
+	for (int c = 0; c < MAXPLAYERS; ++c) {
+		if (client_disconnected[c]) continue;
+		Entity* pa = mymod_partner[c] ? uidToEntity(mymod_partner[c]) : nullptr;
+		Entity* fo = mymod_findFollower(c);
+		messagePlayer(pnum, MESSAGE_MISC,
+			"[MYMOD] p%d busy=%d partner=%u(%s) nearest-follower=%u",
+			c, (int)mymod_convo[c].inflight.load(), (unsigned)mymod_partner[c],
+			pa ? getMonsterLocalizedName(pa->getRace()).c_str() : "none",
+			(unsigned)(fo ? fo->getUID() : 0));
+	}
+	messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] watching %d follower(s):", (int)mymod_watch.size());
+	for (auto& kv : mymod_watch) {
+		Entity* e = uidToEntity(kv.first);
+		messagePlayer(pnum, MESSAGE_MISC,
+			"[MYMOD]   uid=%u owner=p%d hp=%d/%d adrift=%s",
+			(unsigned)kv.first, kv.second.owner, kv.second.lastHP, kv.second.maxHP,
+			kv.second.farSince ? "yes" : "no");
+		(void)e;
+	}
+	if (mymod_herx_debuff > 0) {
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] herx debuff=%d informant=%u",
+			mymod_herx_debuff, (unsigned)mymod_herx_informant);
+	}
 }
 
 // HOST: a player engaged an NPC (clicked them). Make them the conversation partner and

@@ -974,11 +974,17 @@ static ConsoleCommand ccmd_aiforceattack("/aiforceattack", "MYMOD: directly orde
 		messagePlayer(clientnum, MESSAGE_MISC, "[MYMOD] AI server set to: %s", mymod_ai_server.c_str());
 		});
 
-static ConsoleCommand ccmd_aicommand("/aicommand", "MYMOD: talk to YOUR follower (typed)", []CCMD{
+static ConsoleCommand ccmd_aicommand("/aicommand", "MYMOD: talk to your follower, or whoever you engaged (typed)", []CCMD{
 		if (!(svFlags & SV_FLAG_CHEATS)) { messagePlayer(clientnum, MESSAGE_MISC, Language::get(277)); return; }
 		std::string says;
 		for (int i = 1; i < argc; ++i) { if (i > 1) says += " "; says += argv[i]; }
+		// No text: stop addressing the NPC you engaged and go back to your own follower.
+		if (says.empty()) { mymod_clearPartner(clientnum); return; }
 		::mymod_sendToFollower(says);
+		});
+
+	static ConsoleCommand ccmd_aistatus("/aistatus", "MYMOD: dump what the mod currently believes", []CCMD{
+		mymod_debugStatus(clientnum);
 		});
 
 	static ConsoleCommand ccmd_friendly("/friendly", "make all NPCs friendly (cheat)", []CCMD{

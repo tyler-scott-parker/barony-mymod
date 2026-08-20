@@ -36,3 +36,5 @@ void mymod_netClientRecvShopLine();// 'MYSH'  host -> client: a merchant's line 
 // and from startTradingServer (opening a merchant's shop).
 bool mymod_npcEngage(int player, Entity* npc);   // true = an AI line is coming; false = use vanilla
 void mymod_onFollowerHitByPlayer(Entity* victim, Entity* attacker);  // friendly fire -> resentment
+void mymod_clearPartner(int player);   // stop addressing an NPC, go back to your follower
+void mymod_debugStatus(int player);    // /aistatus -- what the mod currently believes
