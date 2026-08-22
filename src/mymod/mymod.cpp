@@ -390,6 +390,21 @@ static bool mymod_anyPlayerBusy() {
 	return false;
 }
 
+// Polymorph-as-comprehension: the service only filters when it is TOLD what the player
+// currently IS, and nothing was ever sending that -- so can_understand() took its
+// `if not player_race: return True` path every time and the feature was dead code.
+//
+// Deliberately the SHAPESHIFT form, not the chosen race. Sending the chosen race would mean a
+// vampire/succubus/incubus player (all unlocked by DLC pack 1/2) understands nobody, which is
+// worse than no filter at all. Not polymorphed -> field omitted -> service passes everything.
+static std::string mymod_polymorphRace(int pnum) {
+	if (pnum < 0 || pnum >= MAXPLAYERS) return "";
+	if (!players[pnum] || !players[pnum]->entity) return "";
+	const Sint32 form = players[pnum]->entity->effectShapeshift;   // skill[53]
+	if (form == NOTHING) return "";
+	return getMonsterLocalizedName((Monster)form);
+}
+
 void mymod_ambientTick() {
 	if (!mymod_isHost()) return;
 	// Fight-survival scan: runs first so combat is tracked every frame, even during
@@ -538,8 +553,10 @@ void mymod_ambientTick() {
 		mymod_convo[MYMOD_WORLD_SLOT].prefix = "[taunt] ";
 		mymod_convo[MYMOD_WORLD_SLOT].speaker_uid = tauntTarget->getUID();
 		char payload[512];
-		snprintf(payload, sizeof(payload), "{\"race\":\"%s\",\"floor\":%d,\"taunt\":true}",
-			raceName.c_str(), currentlevel);
+		std::string pform = mymod_polymorphRace(clientnum);
+		snprintf(payload, sizeof(payload),
+			"{\"race\":\"%s\",\"floor\":%d,\"taunt\":true,\"player_race\":\"%s\"}",
+			raceName.c_str(), currentlevel, mymod_jsonEscape(pform).c_str());
 		mymod_asyncAmbient(payload);
 		return;
 	}
@@ -556,9 +573,11 @@ void mymod_ambientTick() {
 	mymod_convo[MYMOD_WORLD_SLOT].prefix = "[overheard] ";
 	mymod_convo[MYMOD_WORLD_SLOT].speaker_uid = calmPick->getUID();
 	char payload[512];
+	std::string pform = mymod_polymorphRace(clientnum);
 	snprintf(payload, sizeof(payload),
-		"{\"race\":\"%s\",\"floor\":%d,\"ambient\":true,\"relation\":\"%s\"}",
-		raceName.c_str(), currentlevel, relation.c_str());
+		"{\"race\":\"%s\",\"floor\":%d,\"ambient\":true,\"relation\":\"%s\","
+		"\"player_race\":\"%s\"}",
+		raceName.c_str(), currentlevel, relation.c_str(), mymod_jsonEscape(pform).c_str());
 	mymod_asyncAmbient(payload);
 }
 
