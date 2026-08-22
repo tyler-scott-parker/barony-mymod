@@ -736,14 +736,24 @@ static void mymod_minotaurWarningTick() {
 	}
 }
 
+// ⚠ Belt and braces against the SERVICE's once-per-run latch. That latch lives in RAM, so a
+// host who restarts service.py mid-playthrough re-arms it -- true of all run state, but this is
+// the only thing that can actively cost the player the run, so the engine keeps its own.
+static bool mymod_sabotageUsed = false;
+
 static void mymod_callMinotaur(int pnum) {
 	if (!mymod_isHost() || intro || !map.entities) return;
+	if (mymod_sabotageUsed) {
+		mymod_log("sabotage: already spent this run; refused");
+		return;
+	}
 	if (pnum < 0 || pnum >= MAXPLAYERS || !players[pnum] || !players[pnum]->entity) return;
 	if (minotaurlevel) {
 		// A timer already exists from level generation; a second one would stack two arrivals.
 		mymod_log("sabotage: minotaur already due on this floor, spy's attempt does nothing");
 		return;
 	}
+	mymod_sabotageUsed = true;
 	minotaurlevel = 1;
 	createMinotaurTimer(players[pnum]->entity, &map, local_rng.getU32());
 	// Same warning a normal minotaur floor gives, a few seconds behind the spy's line.
@@ -1972,6 +1982,7 @@ void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor)
 	if (etype && !strcmp(etype, "new_run")) {
 		mymod_minoWarnAt = 0;   // a pending warning must not follow the party to a new run
 		mymod_minoWarn2At = 0;
+		mymod_sabotageUsed = false;
 		for (int c = 0; c < MAXPLAYERS; ++c) { mymod_partner[c] = 0; mymod_shopLine[c].clear(); }
 		mymod_watch.clear();
 		mymod_hurtCooldown.clear();
