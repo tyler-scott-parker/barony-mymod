@@ -62,6 +62,7 @@ struct MymodConvo {
 	std::string name;           // follower given-name ("" if none)
 	std::string boon;           // "item:TYPE:N" or "traps:" pending application
 	std::string haggle;         // "<shopkeeper uid>:<percent>" from a merchant negotiation
+	std::string sabotage;       // "minotaur" -- a spy spending the player's floor against them
 	std::string prefix;         // chat-line label, e.g. "[taunt] " or "Ada's Grix: "
 	std::string ident;          // "1" = the identification was correct AND honest
 	uint32_t follower_uid = 0;  // who this slot is talking to (0 = world channel)
@@ -671,6 +672,28 @@ static void mymod_applyHaggle(const std::string& field) {
 	mymod_netBroadcastHaggle(uid, pct);
 }
 
+// ---- Spy sabotage: calling the minotaur --------------------------------------------------
+// The engine does the work. createMinotaurTimer() is a plain call already used by level
+// generation (maps.cpp:7200) and by the /minotaur cheat (consolecommand.cpp:2544), so starting
+// a countdown on a floor that was not a minotaur level is supported rather than a hack.
+//
+// ⚠ Silent on purpose. The minotaur warning speech fires on level ENTRY (actplayer.cpp:8089),
+// so a timer started mid-floor announces nothing -- the consequence simply arrives ~150s later
+// (210s below floor 5, on 10-14 and 25+) and the player has to work backwards to the spy.
+static void mymod_callMinotaur(int pnum) {
+	if (!mymod_isHost() || intro || !map.entities) return;
+	if (pnum < 0 || pnum >= MAXPLAYERS || !players[pnum] || !players[pnum]->entity) return;
+	if (minotaurlevel) {
+		// A timer already exists from level generation; a second one would stack two arrivals.
+		mymod_log("sabotage: minotaur already due on this floor, spy's attempt does nothing");
+		return;
+	}
+	minotaurlevel = 1;
+	createMinotaurTimer(players[pnum]->entity, &map, local_rng.getU32());
+	mymod_log("sabotage: p%d's follower started the minotaur countdown on floor %d",
+		pnum, currentlevel);
+}
+
 // Item names the service may send in a boon payload, mapped to Barony's ItemType.
 static const struct { const char* name; ItemType type; } MYMOD_BOON_ITEMS[] = {
 	{"FOOD_BREAD", FOOD_BREAD}, {"FOOD_CHEESE", FOOD_CHEESE}, {"GEM_GLASS", GEM_GLASS},
@@ -1213,6 +1236,7 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 		std::string boon   = mymod_jsonField(body, "boon");
 		std::string ident  = mymod_jsonField(body, "identify");
 		std::string hag    = mymod_jsonField(body, "haggle");
+		std::string sab    = mymod_jsonField(body, "sabotage");
 		if (action.empty()) action = "NONE";
 		if (ident.empty())  ident = "0";
 		mymod_trimTail(speech);
@@ -1228,6 +1252,7 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 		{
 			std::lock_guard<std::mutex> lock(c.mutex);
 			c.reply = speech; c.action = action; c.name = gname; c.boon = boon; c.haggle = hag;
+			c.sabotage = sab;
 		}
 		c.ready.store(true);
 	}).detach();
@@ -1659,11 +1684,15 @@ static void mymod_broadcastLine(uint32_t speakerUID, const std::string& prefix, 
 static void mymod_deliverSlot(int slot) {
 	MymodConvo& cv = mymod_convo[slot];
 	if (!cv.ready.load()) return;
-	std::string reply, action, gname, boon, haggle;
+	std::string reply, action, gname, boon, haggle, sabotage;
 	{
 		std::lock_guard<std::mutex> lock(cv.mutex);
 		reply = cv.reply; action = cv.action; gname = cv.name; boon = cv.boon; haggle = cv.haggle;
+		sabotage = cv.sabotage;
 	}
+	// Applied on the main thread, before the line is spoken: the tell should land at the same
+	// moment the clock starts, not after it.
+	if (sabotage == "minotaur") { mymod_callMinotaur(slot < MAXPLAYERS ? slot : 0); cv.sabotage.clear(); }
 	// Main thread: the price map is read from Item::buyValue on this thread too.
 	if (!haggle.empty()) { mymod_applyHaggle(haggle); cv.haggle.clear(); }
 	cv.ready.store(false);
