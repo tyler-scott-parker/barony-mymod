@@ -1040,9 +1040,14 @@ void mymod_ambientTick() {
 		mymod_convo[MYMOD_WORLD_SLOT].speaker_uid = tauntTarget->getUID();
 		char payload[512];
 		std::string pform = mymod_polymorphRace(clientnum);
+		// The map name matters as much here as in conversation: without it the service can
+		// only say "dungeon floor 25", and a shopkeeper standing in Hamlet mutters about the
+		// dungeon. Same fix place_name() already made for the conversation path.
 		snprintf(payload, sizeof(payload),
-			"{\"race\":\"%s\",\"floor\":%d,\"taunt\":true,\"player_race\":\"%s\"}",
-			raceName.c_str(), currentlevel, mymod_jsonEscape(pform).c_str());
+			"{\"race\":\"%s\",\"floor\":%d,\"taunt\":true,\"player_race\":\"%s\","
+			"\"map\":\"%s\"}",
+			raceName.c_str(), currentlevel, mymod_jsonEscape(pform).c_str(),
+			mymod_jsonEscape(map.name).c_str());
 		mymod_asyncAmbient(payload);
 		return;
 	}
@@ -1062,8 +1067,9 @@ void mymod_ambientTick() {
 	std::string pform = mymod_polymorphRace(clientnum);
 	snprintf(payload, sizeof(payload),
 		"{\"race\":\"%s\",\"floor\":%d,\"ambient\":true,\"relation\":\"%s\","
-		"\"player_race\":\"%s\"}",
-		raceName.c_str(), currentlevel, relation.c_str(), mymod_jsonEscape(pform).c_str());
+		"\"player_race\":\"%s\",\"map\":\"%s\"}",
+		raceName.c_str(), currentlevel, relation.c_str(), mymod_jsonEscape(pform).c_str(),
+		mymod_jsonEscape(map.name).c_str());
 	mymod_asyncAmbient(payload);
 }
 
