@@ -33,6 +33,13 @@ void mymod_netClientRecvShopLine();// 'MYSH'  host -> client: a merchant's line 
 void mymod_netServerRecvIdentify();       // 'MYID'  client -> host: item it wants identified
 void mymod_netClientRecvIdentifyVerdict();// 'MYIV'  host -> client: was the claim true?
 void mymod_netClientRecvFriendly();       // 'MYFR'  host -> client: /friendly state (test harness)
+void mymod_netRecvHaggle();               // 'MYHG'  host -> client: a merchant's haggled price shift
+
+// --- haggled shop prices ---
+// Called from Item::buyValue/sellValue -- the only two functions the shop DISPLAY and the
+// transaction both pass through, so the quoted price and the charged price cannot disagree.
+// Returns 1.0 when nothing has been negotiated, which is every shop until a player asks.
+double mymod_priceModifier(int player, bool selling);
 
 // --- non-follower NPCs (townsfolk, merchants, named characters) ---
 // Called when a player engages an NPC: from handleMonsterChatter (clicking a talking NPC)

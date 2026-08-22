@@ -61,6 +61,7 @@ struct MymodConvo {
 	std::string action;         // "FOLLOW"/"DEFEND"/"WAIT"/"ATTACK"/"NONE"
 	std::string name;           // follower given-name ("" if none)
 	std::string boon;           // "item:TYPE:N" or "traps:" pending application
+	std::string haggle;         // "<shopkeeper uid>:<percent>" from a merchant negotiation
 	std::string prefix;         // chat-line label, e.g. "[taunt] " or "Ada's Grix: "
 	std::string ident;          // "1" = the identification was correct AND honest
 	uint32_t follower_uid = 0;  // who this slot is talking to (0 = world channel)
@@ -398,6 +399,42 @@ static int mymod_disarmFloorTraps() {
 		}
 	}
 	return n;
+}
+
+// ---- Haggled prices --------------------------------------------------------------------
+// A merchant who likes you shades the price your way. Deliberately tiny: Barony's own trading
+// skill already swings buy prices from x3.00 down to x1.00 (items.cpp:5990) and charisma moves
+// sell prices by up to +100%, so anything with real economic weight here would be a worse
+// version of a system the game already has. The cap is +/-5%.
+//
+// Negative percent = better for the player, on BOTH sides of the counter -- so the sign is
+// flipped when selling, or "a good deal" would mean opposite things buying and selling.
+//
+// ⚠ Applied inside Item::buyValue/sellValue rather than at the point of purchase. Those are
+// the only functions BOTH the shop display and the transaction go through, so the price shown
+// and the price charged cannot disagree. Hooking the purchase alone is how you get a shop that
+// quotes one number and takes another.
+static std::map<uint32_t, int> mymod_haggle;   // shopkeeper uid -> percent, host-authoritative
+void mymod_netBroadcastHaggle(uint32_t shopUID, int pct);
+
+double mymod_priceModifier(int player, bool selling) {
+	if (player < 0 || player >= MAXPLAYERS) return 1.0;
+	auto it = mymod_haggle.find(shopkeeper[player]);
+	if (it == mymod_haggle.end() || it->second == 0) return 1.0;
+	const double pct = (double)it->second / 100.0;
+	return selling ? (1.0 - pct) : (1.0 + pct);
+}
+
+// "<uid>:<percent>" from the service. Applied on the main thread, like every other reply field.
+static void mymod_applyHaggle(const std::string& field) {
+	const size_t colon = field.find(':');
+	if (colon == std::string::npos) return;
+	const uint32_t uid = (uint32_t)strtoul(field.substr(0, colon).c_str(), nullptr, 10);
+	const int pct = atoi(field.substr(colon + 1).c_str());
+	if (!uid) return;
+	mymod_haggle[uid] = pct;
+	mymod_log("haggle: merchant %u now at %+d%% for the party", (unsigned)uid, pct);
+	mymod_netBroadcastHaggle(uid, pct);
 }
 
 // Item names the service may send in a boon payload, mapped to Barony's ItemType.
@@ -951,7 +988,7 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 		char cmd[1536];
 		snprintf(cmd, sizeof(cmd),
 			"curl -s %s -X POST -H 'Content-Type: application/json' --data @%s > %s 2>/dev/null; "
-			"python3 -c 'import json;d=json.load(open(\"%s\"));print(d.get(\"reply\",\"\"));print(\"::ACTION::\"+d.get(\"action\",\"NONE\"));print(\"::NAME::\"+d.get(\"name\",\"\"));print(\"::SECRET::\"+d.get(\"secret\",\"\"));print(\"::BOON::\"+d.get(\"boon\",\"\"));print(\"::IDENT::\"+d.get(\"identify\",\"0\"))'",
+			"python3 -c 'import json;d=json.load(open(\"%s\"));print(d.get(\"reply\",\"\"));print(\"::ACTION::\"+d.get(\"action\",\"NONE\"));print(\"::NAME::\"+d.get(\"name\",\"\"));print(\"::SECRET::\"+d.get(\"secret\",\"\"));print(\"::BOON::\"+d.get(\"boon\",\"\"));print(\"::IDENT::\"+d.get(\"identify\",\"0\"));print(\"::HAGGLE::\"+d.get(\"haggle\",\"\"))'",
 			server.c_str(), payloadPath, replyPath, replyPath);
 		FILE* pipe = popen(cmd, "r");
 		std::string out;
@@ -970,10 +1007,12 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 		if (smark != std::string::npos) { sec = gname.substr(smark + 10); gname = gname.substr(0, smark); }
 		size_t bmark = sec.find("::BOON::");
 		if (bmark != std::string::npos) { boon = sec.substr(bmark + 8); sec = sec.substr(0, bmark); }
-		std::string ident;
+		std::string ident, hag;
 		size_t imark = boon.find("::IDENT::");
 		if (imark != std::string::npos) { ident = boon.substr(imark + 9); boon = boon.substr(0, imark); }
-		for (std::string* v : {&action, &gname, &sec, &boon, &ident}) mymod_trimTail(*v, "\n\r \t");
+		size_t hmark = ident.find("::HAGGLE::");
+		if (hmark != std::string::npos) { hag = ident.substr(hmark + 10); ident = ident.substr(0, hmark); }
+		for (std::string* v : {&action, &gname, &sec, &boon, &ident, &hag}) mymod_trimTail(*v, "\n\r \t");
 		c.ident = ident;
 		if (!sec.empty()) {
 			size_t colon = sec.find(":");
@@ -984,7 +1023,7 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 		}
 		{
 			std::lock_guard<std::mutex> lock(c.mutex);
-			c.reply = speech; c.action = action; c.name = gname; c.boon = boon;
+			c.reply = speech; c.action = action; c.name = gname; c.boon = boon; c.haggle = hag;
 		}
 		c.ready.store(true);
 	}).detach();
@@ -1375,6 +1414,31 @@ void mymod_sendToFollower(const std::string& says) {
 //  DELIVERY
 // =============================================================================
 
+// Host -> clients ('MYHG'): a merchant's negotiated price shift. Clients compute shop prices
+// themselves for display (monster_shopkeeper.cpp:1074 calls buyValue with clientnum), so
+// without this a client would see the pre-haggle price and be charged the post-haggle one.
+void mymod_netBroadcastHaggle(uint32_t shopUID, int pct) {
+	if (multiplayer != SERVER) return;
+	for (int c = 1; c < MAXPLAYERS; ++c) {
+		if (client_disconnected[c] || players[c]->isLocalPlayer()) continue;
+		memcpy((char*)net_packet->data, "MYHG", 4);
+		SDLNet_Write32(shopUID, &net_packet->data[4]);
+		// Offset by 100 so a markdown survives the trip as an unsigned byte.
+		net_packet->data[8] = (Uint8)(pct + 100);
+		net_packet->address.host = net_clients[c - 1].host;
+		net_packet->address.port = net_clients[c - 1].port;
+		net_packet->len = 9;
+		sendPacketSafe(net_sock, -1, net_packet, c - 1);
+	}
+}
+
+// Client side of 'MYHG'.
+void mymod_netRecvHaggle() {
+	const uint32_t uid = (uint32_t)SDLNet_Read32(&net_packet->data[4]);
+	const int pct = (int)net_packet->data[8] - 100;
+	if (uid) mymod_haggle[uid] = pct;
+}
+
 // Fan a line out to every player: chat for all, bubble for all. On the host,
 // messagePlayerColor() and createDialogueTooltip() emit the vanilla MSGS/BUBL packets
 // for remote players themselves, so this one loop reaches the whole party.
@@ -1391,11 +1455,13 @@ static void mymod_broadcastLine(uint32_t speakerUID, const std::string& prefix, 
 static void mymod_deliverSlot(int slot) {
 	MymodConvo& cv = mymod_convo[slot];
 	if (!cv.ready.load()) return;
-	std::string reply, action, gname, boon;
+	std::string reply, action, gname, boon, haggle;
 	{
 		std::lock_guard<std::mutex> lock(cv.mutex);
-		reply = cv.reply; action = cv.action; gname = cv.name; boon = cv.boon;
+		reply = cv.reply; action = cv.action; gname = cv.name; boon = cv.boon; haggle = cv.haggle;
 	}
+	// Main thread: the price map is read from Item::buyValue on this thread too.
+	if (!haggle.empty()) { mymod_applyHaggle(haggle); cv.haggle.clear(); }
 	cv.ready.store(false);
 	cv.inflight.store(false);
 	cv.name.clear();

@@ -13,6 +13,7 @@
 #include "game.hpp"
 #include "stat.hpp"
 #include "items.hpp"
+#include "mymod/mymod.hpp"   // MYMOD: haggled shop prices
 #include "messages.hpp"
 #include "interface/interface.hpp"
 #include "magic/magic.hpp"
@@ -5992,6 +5993,11 @@ int Item::buyValue(const int player) const
 	// charisma bonus
 	/*value /= 1.f + statGetCHR(stats[player], players[player]->entity) / 20.f;*/
 
+	// MYMOD: a merchant you have talked round (or annoyed) shades the price. +/-5% at most,
+	// which is nothing beside the x3.00 -> x1.00 swing the trading skill above already applies.
+	// Applied HERE so the shop display and the transaction get the same number.
+	value *= mymod_priceModifier(player, false);
+
 	// result
 	value = std::max(1, value);
 
@@ -6054,6 +6060,10 @@ int Item::sellValue(const int player) const
 
 		// charisma bonus
 		value *= 1.f + statGetCHR(stats[player], players[player]->entity) / 20.f;
+
+		// MYMOD: see buyValue. The helper flips the sign when selling, so a merchant who likes
+		// you pays you MORE for the same negotiated percentage.
+		value *= mymod_priceModifier(player, true);
 	}
 
 	// result
