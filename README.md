@@ -1,38 +1,66 @@
-![Linux-CI_fmod_steam](https://github.com/TurningWheel/Barony/workflows/Linux-CI_fmod_steam/badge.svg) ![Linux-CI_fmod_steam_eos](https://github.com/TurningWheel/Barony/workflows/Linux-CI_fmod_steam_eos/badge.svg)
+# Adorcism — the Barony engine mod
 
-# Update - 3rd October 2023
+A fork of **[TurningWheel/Barony](https://github.com/TurningWheel/Barony)** v5.0.2 carrying the
+engine half of [Adorcism](https://github.com/tyler-scott-parker/barony-ai), which makes every
+creature in the dungeon talk, remember, and have opinions about you.
 
-The current 'develop' branch contains in-development features for our latest update. For bugfixes + PRs, open them against 'master'.
+Barony's own README is preserved as **[README.upstream.md](README.upstream.md)**. Everything
+below is about the fork.
 
-# Compilation Instructions
+## Where the mod lives
 
-The compilation instructions can be found in [INSTALL.md](INSTALL.md)
+Almost all of it is in **`src/mymod/`**, extracted so upstream merges stay clean:
 
-# Open-source Announcement Letter
+| File | |
+|---|---|
+| `mymod.cpp` / `mymod.hpp` | the mod itself |
+| `mymod_net.hpp` | transport to the service (SDL_net) and the reply reader |
+| `mymod_voice.hpp` | push-to-talk resampling and WAV framing |
+| `httptest.cpp`, `wavtest.cpp`, `packtest.cpp` | standalone tests, deliberately not in the build |
 
-Well here it is, as promised: the open source release of Barony. Keep in mind you still need a purchased copy of Barony to play this. I'd recommend that you thumb through all of the included text files to get a feeling of other things you'll need to build the game and check out the included licenses as well.
+The rest of the diff is **hooks into upstream files**, kept as small as possible. The full list —
+and *why each one is where it is* — is in `CLAUDE.md` in the
+[service repo](https://github.com/tyler-scott-parker/barony-ai), which is the real design document
+for this project. Read that before changing anything here.
 
-Many thanks go to Ciprian Elies for his original contributions to the game code, as well as for the build systems, config files, and support libraries that he developed for the project over the years. In the future, he plans to head up development on some new stuff for Barony, so keep an eye out for that.
+| Upstream file | Why it is touched |
+|---|---|
+| `game.cpp` | per-frame poll and ambient tick |
+| `actmonster.cpp` | recruitment, friendly fire, NPC engagement |
+| `net.cpp` | seven mod packets, plus the chat bridge for unmodded clients |
+| `items.cpp` | haggled shop prices, inside `buyValue`/`sellValue` |
+| `shops.cpp` | merchant greeting on shop open |
+| `player.cpp` | the client half of `/friendly` |
+| `files.cpp` | new-run detection, plus a weak stub so the editor still links |
+| `monster_lich.cpp` | applies the Baron's secret weakness |
+| `consolecommand.cpp` | `/aicommand`, `/aiserver`, `/aiidentify`, `/aistatus`, `/ailog` |
 
-This project was a first for both of us in many ways and it shows. Since all of the original code was written in C and hastily converted to C++ in the past few months, experienced C++ programmers may be horrified at some of the kludge we had to write to get some of the more basic systems working properly. There's not a lot of module organization either since I didn't understand how to properly write projects that scale when I started the code three years ago. Prepare to deal with lots of global variables that get used all over the project indiscriminately.
+## Building
 
-Despite the project's shortcomings, I'm reasonably proud of how the end product turned out. Writing good games is about more than just writing good code, though I guarantee we'll be taking all of the lessons learned from Barony into our next project.
+```bash
+mkdir build && cd build
+cmake .. -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DOPENAL_ENABLED=OFF -DFMOD_ENABLED=OFF \
+         -DSTEAMWORKS_ENABLED=OFF -DEOS_ENABLED=OFF
+make -j$(nproc)
+```
 
-I'm not sure how many people will be interested in working on this, and it may take a while for anything substantial to get going here, but I'd be pleased to see some coordinated efforts take place on this code sometime in the coming years.
+The binary runs from **anywhere** — what matters is the working directory, not where the
+executable sits. Launch it with the Barony install as the working directory and it reads the
+game's data in place, writing nothing into it. That is what `dist/setup.sh` in the service repo
+automates, and it means Steam can verify or update Barony without ever disturbing the mod.
 
-Some project ideas:
+For a build that unlocks DLC against real Steam entitlement, see the Steamworks section of
+`CLAUDE.md` — the short version is that `-DSTEAMWORKS_ENABLED=ON` alone does **not** define the
+`STEAMWORKS` macro, and the SDK must be 1.53a.
 
- * Add an extra hard mode to the game.
- * Add a dungeon with infinite levels.
- * Create a dedicated server.
- * Multithread the packet handler.
- * Multithread the entity logic.
- * Add script support for entities and items.
- * Add persistent levels and servers.
- * Add fully 3D physics and world geometry.
- * Renovate the OpenGL code to a modern standard.
+## Status
 
-Have fun,
+**No Windows build yet.** The code is portable — no shell-outs, no hardcoded paths, SDL and
+SDL_net for everything platform-facing — but nobody has compiled it with MSVC. Multiplayer is
+implemented and verified by reading and by driving both sides locally, but has never met a second
+machine.
 
-Sheridan
-June 27th 2016
+## Licence
+
+Barony is BSD 2-Clause, © 2013-2020 Turning Wheel LLC — see [LICENSE.txt](LICENSE.txt), which
+applies to this fork and to any binary built from it.
