@@ -37,6 +37,7 @@ void mymod_netServerRecvIdentify();       // 'MYID'  client -> host: item it wan
 void mymod_netClientRecvIdentifyVerdict();// 'MYIV'  host -> client: was the claim true?
 void mymod_netClientRecvFriendly();       // 'MYFR'  host -> client: /friendly state (test harness)
 void mymod_netRecvHaggle();               // 'MYHG'  host -> client: a merchant's haggled price shift
+void mymod_cloudMapHere();                // 'MYFG'  host -> client: a spy wiped your minimap
 
 // --- haggled shop prices ---
 // Called from Item::buyValue/sellValue -- the only two functions the shop DISPLAY and the

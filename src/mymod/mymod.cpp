@@ -856,6 +856,47 @@ static void mymod_favourTick() {
 		getMonsterLocalizedName(g->getRace(), g->getStats()), owner);
 }
 
+// ---- Spy sabotage: clouding the map --------------------------------------------------------
+// The mirror of the map boon. A CURSED scroll of magic mapping already does exactly this --
+// wipes minimap[][] and says "Huh? What? Where am I?" (item_usage_funcs.cpp:3914, Language 869)
+// -- so the effect and its message are both the game's own, and the message is perfect here:
+// disorienting, and it does not say who did it.
+//
+// ⚠ Unlike revealing, this needs a packet. spell_magicMap sends 'MMAP' for a remote client but
+// there is no vanilla equivalent for un-mapping, and the cursed-scroll path bails out entirely
+// for a remote player (`if (multiplayer == SERVER && player > 0) return;`), because the client
+// runs its own copy. So the wipe is client-local and the host has to ask for it.
+void mymod_netSendCloudMap(int pnum) {
+	if (multiplayer != SERVER || pnum <= 0 || pnum >= MAXPLAYERS) return;
+	if (client_disconnected[pnum] || players[pnum]->isLocalPlayer()) return;
+	memcpy((char*)net_packet->data, "MYFG", 4);
+	net_packet->data[4] = (Uint8)pnum;
+	net_packet->address.host = net_clients[pnum - 1].host;
+	net_packet->address.port = net_clients[pnum - 1].port;
+	net_packet->len = 5;
+	sendPacketSafe(net_sock, -1, net_packet, pnum - 1);
+}
+
+// Client side of 'MYFG', and the local path too.
+void mymod_cloudMapHere() {
+	for (int y = 0; y < map.height; ++y) {
+		for (int x = 0; x < map.width; ++x) {
+			minimap[y][x] = 0;
+		}
+	}
+	messagePlayer(clientnum, MESSAGE_HINT, "%s", Language::get(869));   // "Huh? What? Where am I?"
+}
+
+static void mymod_cloudMap(int pnum) {
+	if (pnum < 0 || pnum >= MAXPLAYERS) return;
+	if (players[pnum] && players[pnum]->isLocalPlayer()) {
+		mymod_cloudMapHere();
+	} else {
+		mymod_netSendCloudMap(pnum);
+	}
+	mymod_log("sabotage: p%d's map was clouded on floor %d", pnum, currentlevel);
+}
+
 // ---- Spy sabotage: rigging the floor's traps ---------------------------------------------
 // A rigged trap fires TWICE -- a second boulder out of the same hole, a second volley from the
 // same shooter -- a couple of seconds after the first, once the player has stepped clear and
@@ -2126,6 +2167,8 @@ static void mymod_deliverSlot(int slot) {
 		const int who = (slot < MAXPLAYERS ? slot : 0);
 		if (sabotage == "minotaur") {
 			mymod_callMinotaur(who);
+		} else if (sabotage == "fog") {
+			mymod_cloudMap(who);
 		} else if (sabotage == "traps") {
 			const int n = mymod_rigFloorTraps();
 			mymod_log("sabotage: p%d's follower rigged %d trap(s) on floor %d to fire twice",

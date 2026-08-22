@@ -6335,6 +6335,7 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 	// MYMOD: the host's /friendly state, which vanilla never replicates (test harness)
 	{'MYFR', [](){ mymod_netClientRecvFriendly(); }},
 	{'MYHG', [](){ mymod_netRecvHaggle(); }},
+	{'MYFG', [](){ mymod_cloudMapHere(); }},
 
 	// text bubbles
 	{'BUBL', []() {
