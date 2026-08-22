@@ -680,6 +680,62 @@ static void mymod_applyHaggle(const std::string& field) {
 // ⚠ Silent on purpose. The minotaur warning speech fires on level ENTRY (actplayer.cpp:8089),
 // so a timer started mid-floor announces nothing -- the consequence simply arrives ~150s later
 // (210s below floor 5, on 10-14 and 25+) and the player has to work backwards to the spy.
+// The warning a normal minotaur floor gives you, fired on demand.
+//
+// ⚠ A sabotaged floor MUST still warn the player. The minotaur is fast, and 150 seconds of
+// silence followed by it rounding a corner is not tension, it is an unannounced execution --
+// on a floor the player had no reason to expect one. Vanilla's warning is Herx taunting you
+// telepathically (actplayer.cpp:8089), which is exactly right here: it is fair, it is legible,
+// and it does not say who opened the door.
+//
+// ⚠ DELAYED on purpose. Herx gloating in the same beat as the spy's small talk hands the player
+// the culprit for free and throws away the whole tell. A few seconds of separation keeps the
+// two events from reading as cause and effect while costing almost none of the warning time.
+static const uint32_t MYMOD_MINO_WARN_DELAY  = 9 * TICKS_PER_SECOND;
+static const uint32_t MYMOD_MINO_WARN_SECOND = 8 * TICKS_PER_SECOND;   // vanilla's own cadence
+static uint32_t mymod_minoWarnAt = 0;      // 0 = nothing pending
+static uint32_t mymod_minoWarn2At = 0;
+static int      mymod_minoSpeech = 0;
+// ⚠ The floor it was scheduled on. Take the stairs inside the delay window and the warning
+// would otherwise arrive on the NEXT floor -- where level generation has already reset
+// minotaurlevel and destroyed the timer, so Herx would gloat about nothing.
+static int      mymod_minoWarnLevel = -1;
+
+static void mymod_minotaurSay(int langLine, int sound) {
+	for (int c = 0; c < MAXPLAYERS; ++c) {
+		if (client_disconnected[c] || !players[c]) continue;
+		// messagePlayerColor emits the vanilla MSGS packet itself for a remote player, so this
+		// one loop reaches the whole party.
+		messagePlayerColor(c, MESSAGE_WORLD, makeColorRGB(255, 128, 0), "%s",
+			Language::get(langLine));
+		playSoundPlayer(c, sound, 128);
+	}
+}
+
+// Called every frame from the host branch of mymod_pollAI.
+static void mymod_minotaurWarningTick() {
+	if ((mymod_minoWarnAt || mymod_minoWarn2At) && currentlevel != mymod_minoWarnLevel) {
+		mymod_minoWarnAt = mymod_minoWarn2At = 0;
+		mymod_log("sabotage: left the floor before the warning; dropped");
+		return;
+	}
+	if (mymod_minoWarnAt && ticks >= mymod_minoWarnAt) {
+		mymod_minoWarnAt = 0;
+		if (!MFLAG_DISABLEMESSAGES) {
+			mymod_minotaurSay(537, 123 + mymod_minoSpeech);            // "a voice inside your head"
+			mymod_minotaurSay(74 + mymod_minoSpeech, 123 + mymod_minoSpeech);
+			mymod_minoWarn2At = ticks + MYMOD_MINO_WARN_SECOND;
+		}
+		mymod_log("sabotage: minotaur warning delivered");
+	}
+	if (mymod_minoWarn2At && ticks >= mymod_minoWarn2At) {
+		mymod_minoWarn2At = 0;
+		if (!MFLAG_DISABLEMESSAGES) {
+			mymod_minotaurSay(80 + mymod_minoSpeech, 129 + mymod_minoSpeech);
+		}
+	}
+}
+
 static void mymod_callMinotaur(int pnum) {
 	if (!mymod_isHost() || intro || !map.entities) return;
 	if (pnum < 0 || pnum >= MAXPLAYERS || !players[pnum] || !players[pnum]->entity) return;
@@ -690,8 +746,14 @@ static void mymod_callMinotaur(int pnum) {
 	}
 	minotaurlevel = 1;
 	createMinotaurTimer(players[pnum]->entity, &map, local_rng.getU32());
-	mymod_log("sabotage: p%d's follower started the minotaur countdown on floor %d",
-		pnum, currentlevel);
+	// Same warning a normal minotaur floor gives, a few seconds behind the spy's line.
+	mymod_minoSpeech = local_rng.rand() % 3;
+	mymod_minoWarnAt = ticks + MYMOD_MINO_WARN_DELAY;
+	mymod_minoWarnLevel = currentlevel;
+	mymod_log("sabotage: p%d's follower started the minotaur countdown on floor %d "
+		"(warning in %us, arrival in ~%us)", pnum, currentlevel,
+		MYMOD_MINO_WARN_DELAY / TICKS_PER_SECOND,
+		getMinotaurTimeToArrive() / TICKS_PER_SECOND);
 }
 
 // Item names the service may send in a boon payload, mapped to Barony's ItemType.
@@ -1908,6 +1970,8 @@ void mymod_playerNote(int pnum, const std::string& text) {
 void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor) {
 	if (!mymod_isHost()) return;
 	if (etype && !strcmp(etype, "new_run")) {
+		mymod_minoWarnAt = 0;   // a pending warning must not follow the party to a new run
+		mymod_minoWarn2At = 0;
 		for (int c = 0; c < MAXPLAYERS; ++c) { mymod_partner[c] = 0; mymod_shopLine[c].clear(); }
 		mymod_watch.clear();
 		mymod_hurtCooldown.clear();
@@ -1983,6 +2047,7 @@ void mymod_pollAI() {
 	if (!mymod_isHost()) {
 		return;   // clients receive dialogue as vanilla MSGS/BUBL packets; nothing to poll
 	}
+	mymod_minotaurWarningTick();
 	mymod_syncFriendly();   // no-op unless /friendly changed or a client just joined
 	mymod_ambientTick();
 	for (int slot = 0; slot < MYMOD_MAX_SLOTS; ++slot) {
