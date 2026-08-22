@@ -643,6 +643,122 @@ static int mymod_disarmFloorTraps() {
 	return n;
 }
 
+// ---- A trusted follower heading off the minotaur ------------------------------------------
+// The positive counterpart to sabotage: the best a loyal follower could previously do was hand
+// you a healing potion once a run, while a spy had four distinct ways to cost you the run.
+//
+// ⚠ One mechanism covers BOTH sources, because a spy's sabotage creates the same timer entity
+// that level generation does. Watching for the timer rather than hooking the sabotage means a
+// naturally-generated minotaur floor is caught by the same code, in the same beat.
+//
+// Cancelling is the game's own move: actMinotaurTimer ends itself with list_RemoveNode when it
+// is finished (monster_minotaur.cpp:819), so removing the node early is the supported way to
+// stop a countdown rather than a hack.
+static void mymod_broadcastLine(uint32_t speakerUID, const std::string& prefix,
+                                const std::string& text);   // defined below
+
+static uint32_t mymod_minoWarnAt = 0;      // 0 = nothing pending
+static uint32_t mymod_minoWarn2At = 0;
+static int      mymod_minoSpeech = 0;
+
+static bool mymod_minoGuardUsed = false;    // once per RUN -- not a free pass on every floor
+static int  mymod_minoGuardLevel = -1;      // asked about this floor already
+static std::atomic<bool> mymod_minoGuardBusy{false};
+static std::mutex mymod_minoGuardMutex;
+static std::string mymod_minoGuardLine;     // the follower's line, handed to the main thread
+static uint32_t mymod_minoGuardWho = 0;     // whose head it goes over
+static bool mymod_minoGuardCancel = false;
+
+static Entity* mymod_findMinotaurTimer() {
+	if (!map.entities) return nullptr;
+	for (node_t* nd = map.entities->first; nd != NULL; nd = nd->next) {
+		Entity* e = (Entity*)nd->element;
+		if (e && e->behavior == &actMinotaurTimer) return e;
+	}
+	return nullptr;
+}
+
+// The follower best placed to notice: alive, nearby, and not the one who just caused it.
+static Entity* mymod_guardCandidate(int& outOwner) {
+	Entity* best = nullptr;
+	double bestDist = 1e18;
+	outOwner = -1;
+	if (!map.entities) return nullptr;
+	for (node_t* nd = map.entities->first; nd != NULL; nd = nd->next) {
+		Entity* e = (Entity*)nd->element;
+		if (!e || e->behavior != &actMonster) continue;
+		const int owner = mymod_ownerOf(e);
+		if (owner < 0 || !players[owner] || !players[owner]->entity) continue;
+		Stat* s = e->getStats();
+		if (!s || s->HP <= 0) continue;
+		if (mymod_originOf(e) == MYMOD_ORIGIN_BOT) continue;   // a turret notices nothing
+		const double dx = e->x - players[owner]->entity->x;
+		const double dy = e->y - players[owner]->entity->y;
+		const double d = dx*dx + dy*dy;
+		if (d < bestDist) { bestDist = d; best = e; outOwner = owner; }
+	}
+	return best;
+}
+
+static void mymod_guardFetch(uint32_t uid, const std::string& race, int owner) {
+	mymod_minoGuardBusy.store(true);
+	char payload[512];
+	snprintf(payload, sizeof(payload),
+		"{\"minotaur_guard\":true,\"uid\":%u,\"race\":\"%s\",\"floor\":%d,"
+		"\"player\":%d,\"map\":\"%s\"}",
+		(unsigned)uid, race.c_str(), currentlevel, owner,
+		mymod_jsonEscape(map.name).c_str());
+	std::string body = payload, server = mymod_ai_server;
+	std::thread([body, server, uid]() {
+		std::string resp;
+		mymod_httpPost(server, body, resp);
+		{
+			std::lock_guard<std::mutex> lk(mymod_minoGuardMutex);
+			mymod_minoGuardLine = mymod_jsonField(resp, "reply");
+			mymod_minoGuardCancel = (mymod_jsonField(resp, "guard") == "1");
+			mymod_minoGuardWho = uid;
+		}
+		mymod_minoGuardBusy.store(false);
+	}).detach();
+}
+
+static void mymod_minotaurGuardTick() {
+	// Deliver a finished answer first.
+	std::string line; uint32_t who = 0; bool cancel = false;
+	{
+		std::lock_guard<std::mutex> lk(mymod_minoGuardMutex);
+		if (!mymod_minoGuardLine.empty() || mymod_minoGuardCancel) {
+			line.swap(mymod_minoGuardLine);
+			who = mymod_minoGuardWho;
+			cancel = mymod_minoGuardCancel;
+			mymod_minoGuardCancel = false;
+			mymod_minoGuardWho = 0;
+		}
+	}
+	if (cancel) {
+		if (Entity* t = mymod_findMinotaurTimer()) {
+			list_RemoveNode(t->mynode);        // the game's own way of ending the countdown
+			mymod_minoGuardUsed = true;
+			mymod_minoWarnAt = mymod_minoWarn2At = 0;   // and no warning about a threat that is gone
+			mymod_log("guard: follower %u headed off the minotaur on floor %d",
+				(unsigned)who, currentlevel);
+		}
+	}
+	if (!line.empty()) {
+		mymod_broadcastLine(who, "", line);
+	}
+
+	if (mymod_minoGuardUsed || mymod_minoGuardBusy.load()) return;
+	if (intro || !map.entities || currentlevel == mymod_minoGuardLevel) return;
+	if (!mymod_findMinotaurTimer()) return;      // nothing counting down
+	mymod_minoGuardLevel = currentlevel;         // ask once per floor, whatever the answer
+
+	int owner = -1;
+	Entity* g = mymod_guardCandidate(owner);
+	if (!g || owner < 0) return;
+	mymod_guardFetch(g->getUID(), getMonsterLocalizedName(g->getRace(), g->getStats()), owner);
+}
+
 // ---- Spy sabotage: rigging the floor's traps ---------------------------------------------
 // A rigged trap fires TWICE -- a second boulder out of the same hole, a second volley from the
 // same shooter -- a couple of seconds after the first, once the player has stepped clear and
@@ -792,9 +908,6 @@ static void mymod_applyHaggle(const std::string& field) {
 // two events from reading as cause and effect while costing almost none of the warning time.
 static const uint32_t MYMOD_MINO_WARN_DELAY  = 9 * TICKS_PER_SECOND;
 static const uint32_t MYMOD_MINO_WARN_SECOND = 8 * TICKS_PER_SECOND;   // vanilla's own cadence
-static uint32_t mymod_minoWarnAt = 0;      // 0 = nothing pending
-static uint32_t mymod_minoWarn2At = 0;
-static int      mymod_minoSpeech = 0;
 // ⚠ The floor it was scheduled on. Take the stairs inside the delay window and the warning
 // would otherwise arrive on the NEXT floor -- where level generation has already reset
 // minotaurlevel and destroyed the timer, so Herx would gloat about nothing.
@@ -2102,6 +2215,8 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		mymod_sabotageUsed = false;
 		mymod_rigged.clear();
 		mymod_riggedLevel = -1;
+		mymod_minoGuardUsed = false;
+		mymod_minoGuardLevel = -1;
 		for (int c = 0; c < MAXPLAYERS; ++c) { mymod_partner[c] = 0; mymod_shopLine[c].clear(); }
 		mymod_watch.clear();
 		mymod_hurtCooldown.clear();
@@ -2180,6 +2295,7 @@ void mymod_pollAI() {
 	}
 	mymod_minotaurWarningTick();
 	mymod_riggedTrapTick();
+	mymod_minotaurGuardTick();
 	mymod_syncFriendly();   // no-op unless /friendly changed or a client just joined
 	mymod_ambientTick();
 	for (int slot = 0; slot < MYMOD_MAX_SLOTS; ++slot) {
