@@ -145,6 +145,16 @@ static int mymod_originOf(Entity* e, std::string* keyOut = nullptr) {
 	return MYMOD_ORIGIN_NONE;
 }
 
+// Sentrybots and spellbots are EMPLACEMENTS: bolted down where they were thrown, able only to
+// rotate. There is no pathing branch for them anywhere -- ALLY_CMD_FOLLOW on one just resets
+// monsterSentrybotLookDir and ALLY_CMD_DEFEND only sets a facing (actmonster.cpp:12660-12690).
+// Gyrobots and dummybots DO move, so this is not "is it a bot".
+static bool mymod_isEmplacement(Entity* e) {
+	if (!e || e->behavior != &actMonster) return false;
+	const int race = e->getMonsterTypeFromSprite();
+	return race == SENTRYBOT || race == SPELLBOT;
+}
+
 // A follower whose Stat->name the engine reads back as identity. Renaming one of these is
 // not cosmetic: nameMatchesSpecialNPCName (monster_shared.cpp:569) compares Stat->name
 // directly, so an AI-chosen name makes a skeleton knight stop being one.
@@ -527,7 +537,14 @@ void mymod_ambientTick() {
 			// position (ALLY_STATE_DEFEND) or sent somewhere (ALLY_STATE_MOVETO) is exactly
 			// where it was ordered to be -- and the mod's own DEFEND/WAIT action issues
 			// ALLY_CMD_DEFEND, so without this the player gets resented for being obeyed.
-			if (fe->monsterAllyState == ALLY_STATE_DEFAULT
+			//
+			// ⚠ And never for an EMPLACEMENT. A deployed sentrybot holds the corridor while you
+			// move on -- that is the entire point of the class -- but it sits in
+			// ALLY_STATE_DEFAULT and cannot walk, so it drifted past 25 tiles and resented the
+			// player every 2 minutes for doing exactly what a turret is for. Same failure as
+			// the DEFEND case above: being blamed for obeying, except this one cannot even
+			// disobey.
+			if (fe->monsterAllyState == ALLY_STATE_DEFAULT && !mymod_isEmplacement(fe)
 				&& players[owner] && players[owner]->entity) {
 				double lx = fe->x - players[owner]->entity->x, ly = fe->y - players[owner]->entity->y;
 				if (lx*lx + ly*ly > MYMOD_FAR_RANGE_SQ) {
