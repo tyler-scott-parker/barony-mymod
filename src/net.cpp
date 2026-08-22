@@ -7688,6 +7688,11 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 		Uint32 color = SDLNet_Read32(&net_packet->data[5]);
 		MessageType type = MESSAGE_CHAT; // the only kind of message you can get from a client.
 
+		// MYMOD: a client with no mod installed can still talk to its companion, by prefixing
+		// an ordinary chat line. The line is still relayed to the party below either way --
+		// swallowing it would hide half of the conversation from everyone else.
+		mymod_clientChat(pnum, (char*)(&net_packet->data[9]));
+
 		char shortname[32];
 		stringCopy(shortname, stats[pnum]->name, sizeof(shortname), 22);
 

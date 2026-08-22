@@ -267,6 +267,36 @@ void mymod_netServerRecvSays() {
 	mymod_requestFromPlayer(pnum, says);
 }
 
+// ---- Talking without the mod installed ---------------------------------------------------
+// A vanilla Steam client can already JOIN a modded host: the mod does not touch VERSION
+// (game.hpp:28), and an unrecognised packet is logged and ignored rather than dropping the
+// connection (net.cpp:6832). It can already HEAR everything too, because messagePlayerColor
+// and createDialogueTooltip emit the vanilla MSGS/BUBL packets themselves.
+//
+// The one thing it cannot do is SPEAK, because 'MYAI' is client -> host and vanilla has no
+// idea how to send it. But the host receives every client's ordinary in-game chat
+// (serverPacketHandlers['MSGS'], net.cpp:7685) and knows who sent it -- so a prefixed chat
+// line is all the channel we need. A friend on a stock Steam install types "@stay close" in
+// the chat box and their follower answers. Nothing to download, nothing to configure.
+static const char MYMOD_CHAT_PREFIX = '@';
+
+bool mymod_clientChat(int pnum, const char* msg) {
+	if (!mymod_isHost() || !msg) return false;
+	if (pnum <= 0 || pnum >= MAXPLAYERS) return false;   // 0 is the host, who has /aicommand
+	while (*msg == ' ') ++msg;
+	if (*msg != MYMOD_CHAT_PREFIX) return false;
+	std::string says(msg + 1);
+	while (!says.empty() && says.front() == ' ') says.erase(says.begin());
+	if (says.empty()) {
+		messagePlayer(pnum, MESSAGE_MISC,
+			"[MYMOD] say something after the @ and your companion will hear it");
+		return true;
+	}
+	mymod_log("net: chat-bridge from client p%d (%d bytes)", pnum, (int)says.size());
+	mymod_requestFromPlayer(pnum, says);
+	return true;
+}
+
 // HOST -> clients: a follower chose a name. Clients keep monster stats in clientStats,
 // which vanilla only fills at recruit time ('LEAD'), so a later rename needs its own packet.
 static void mymod_netBroadcastName(uint32_t uid, const std::string& name) {

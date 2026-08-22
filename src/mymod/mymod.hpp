@@ -28,6 +28,9 @@ bool mymod_busy(int player);                          // is this player mid-gene
 
 // --- netcode entry points, registered in net.cpp's packet tables ---
 void mymod_netServerRecvSays();   // 'MYAI'  client -> host: "my player said X to their follower"
+// A client with NO mod installed, talking through ordinary in-game chat. Called from the
+// vanilla 'MSGS' server handler; returns true if the line was an AI utterance.
+bool mymod_clientChat(int pnum, const char* msg);
 void mymod_netClientRecvName();   // 'MYNM'  host -> client: a follower named itself
 void mymod_netClientRecvShopLine();// 'MYSH'  host -> client: a merchant's line for the shop window
 void mymod_netServerRecvIdentify();       // 'MYID'  client -> host: item it wants identified
