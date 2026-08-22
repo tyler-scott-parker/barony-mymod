@@ -378,6 +378,87 @@ void mymod_netClientRecvFriendly() {
 // Push-to-talk: poll the V key, write START/STOP signal files for the Python voice bridge.
 // Runs on every machine — a client that chooses to run the voice bridge gets voice too,
 // and the transcribed text goes out over the same client->host path as typed text.
+// ---- Push-to-talk capture, inside the mod ------------------------------------------------
+// The mic is recorded HERE rather than by a Python helper. That matters most for a co-op
+// client: their machine needs the mod and a transcriber, not sounddevice, numpy and PortAudio
+// as well. Barony never initialises SDL audio (init_flags is VIDEO|EVENTS|JOYSTICK|
+// GAMECONTROLLER|HAPTIC, game.cpp:7288 -- sound goes through FMOD/OpenAL), so the subsystem is
+// brought up lazily on first use and costs nothing for players who never hold the key.
+//
+// ⚠ Audio never crosses the wire. NET_PACKET_SIZE is 512 bytes (game.hpp:38), so three seconds
+// of speech would be ~200 UDP packets; and a private TCP port to the host is worse still,
+// because a Steam lobby has no port at all -- Steam relays everything, and a raw socket would
+// not reach. Whatever transcribes has to run on the speaker's own machine. Only text travels.
+static const int      MYMOD_MIC_RATE     = 16000;    // what Whisper wants; captured natively
+static const uint32_t MYMOD_MIC_MAX_SEC  = 15;       // a stuck key must not eat memory
+static const uint32_t MYMOD_MIC_MIN_MS   = 300;      // ignore an accidental tap
+
+static SDL_AudioDeviceID mymod_mic = 0;
+static std::vector<int16_t> mymod_micBuf;
+static std::mutex mymod_micMutex;
+static bool mymod_micTried = false;
+static uint32_t mymod_micStart = 0;
+static int mymod_micHaveRate = MYMOD_MIC_RATE;
+
+static void mymod_micCallback(void*, Uint8* stream, int len) {
+	std::lock_guard<std::mutex> lk(mymod_micMutex);
+	const size_t cap = (size_t)MYMOD_MIC_RATE * MYMOD_MIC_MAX_SEC;
+	if (mymod_micBuf.size() >= cap) return;
+	const size_t add = std::min((size_t)(len / sizeof(int16_t)), cap - mymod_micBuf.size());
+	mymod_micBuf.insert(mymod_micBuf.end(), (int16_t*)stream, (int16_t*)stream + add);
+}
+
+// Returns false once and complains once; a machine with no microphone should not spam.
+static bool mymod_micOpen() {
+	if (mymod_mic) return true;
+	if (mymod_micTried) return false;
+	mymod_micTried = true;
+	if (!SDL_WasInit(SDL_INIT_AUDIO) && SDL_InitSubSystem(SDL_INIT_AUDIO) != 0) {
+		printlog("[MYMOD] voice: could not start SDL audio: %s", SDL_GetError());
+		return false;
+	}
+	SDL_AudioSpec want{}, have{};
+	want.freq = MYMOD_MIC_RATE;
+	want.format = AUDIO_S16SYS;
+	want.channels = 1;
+	want.samples = 1024;
+	want.callback = mymod_micCallback;
+	// Allow SDL to give us a different rate rather than failing outright; a device that only
+	// does 44100 is common, and resampling one short clip is cheaper than having no voice.
+	mymod_mic = SDL_OpenAudioDevice(nullptr, 1, &want, &have, SDL_AUDIO_ALLOW_FREQUENCY_CHANGE);
+	if (!mymod_mic) {
+		printlog("[MYMOD] voice: no microphone available (%s)", SDL_GetError());
+		return false;
+	}
+	if (have.freq != MYMOD_MIC_RATE) {
+		printlog("[MYMOD] voice: mic runs at %d Hz; clips will be resampled to %d",
+			have.freq, MYMOD_MIC_RATE);
+	}
+	mymod_micHaveRate = have.freq;
+	printlog("[MYMOD] voice: microphone ready (%d Hz)", have.freq);
+	return true;
+}
+
+#include "mymod_voice.hpp"   // resampler + WAV writer, shared with wavtest.cpp
+
+// One seam, deliberately. Today it hands the clip to the Python bridge; embedding whisper.cpp
+// means replacing this body and nothing else -- capture, the key handling and the delivery
+// path above and below it all stay put.
+static void mymod_transcribeClip(const std::vector<int16_t>& pcm) {
+	// Write-then-rename, the same guard the TTS spool uses: the reader must never catch a
+	// half-written clip and transcribe silence.
+	const std::string wav = mymod_tmpPath("mymod_voice_clip.wav");
+	const std::string tmp = wav + ".part";
+	if (!mymod_writeWav(tmp, pcm) || rename(tmp.c_str(), wav.c_str()) != 0) {
+		printlog("[MYMOD] voice: could not write the clip to %s", wav.c_str());
+		return;
+	}
+	// The bridge watches for this file, transcribes it, and drops the text where
+	// mymod_pollPTT picks it up.
+	printlog("[MYMOD] voice: %.1fs clip queued for transcription",
+		(double)pcm.size() / MYMOD_MIC_RATE);
+}
+
 void mymod_pollPTT() {
 	extern std::unordered_map<SDL_Keycode, bool> keystatus;
 	// Voice result: if the bridge dropped transcribed text, feed it to the follower.
@@ -398,15 +479,24 @@ void mymod_pollPTT() {
 			}
 		}
 	}
-	bool down = keystatus[SDLK_v];
+	const bool down = keystatus[SDLK_v];
 	if (down && !mymod_ptt_down) {
-		FILE* f = fopen(mymod_tmpPath("mymod_ptt.signal").c_str(), "w");
-		if (f) { fputs("START", f); fclose(f); }
-		printlog("[MYMOD] listening... (release V to send)");
-	} else if (!down && mymod_ptt_down) {
-		FILE* f = fopen(mymod_tmpPath("mymod_ptt.signal").c_str(), "w");
-		if (f) { fputs("STOP", f); fclose(f); }
-		printlog("[MYMOD] (transcribing...)");
+		if (mymod_micOpen()) {
+			{ std::lock_guard<std::mutex> lk(mymod_micMutex); mymod_micBuf.clear(); }
+			mymod_micStart = SDL_GetTicks();
+			SDL_PauseAudioDevice(mymod_mic, 0);
+			printlog("[MYMOD] listening... (release V to send)");
+		}
+	} else if (!down && mymod_ptt_down && mymod_mic) {
+		SDL_PauseAudioDevice(mymod_mic, 1);
+		std::vector<int16_t> pcm;
+		{ std::lock_guard<std::mutex> lk(mymod_micMutex); pcm.swap(mymod_micBuf); }
+		const uint32_t heldMs = SDL_GetTicks() - mymod_micStart;
+		if (heldMs < MYMOD_MIC_MIN_MS || pcm.empty()) {
+			printlog("[MYMOD] voice: too short, ignored");   // a brush of the key is not speech
+		} else {
+			mymod_transcribeClip(mymod_micResample(pcm, mymod_micHaveRate));
+		}
 	}
 	mymod_ptt_down = down;
 }
