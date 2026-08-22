@@ -195,6 +195,13 @@ static const uint32_t MYMOD_HURT_COOLDOWN  = 10 * 50;     // a flurry of swings 
 // Are we the machine that owns world state and talks to the AI service?
 static inline bool mymod_isHost() { return multiplayer != CLIENT; }
 
+// `about` names a SECOND follower the event concerns -- currently only the one who just died,
+// so the service can ask whether the deceased was a spy before making the survivors grieve.
+// Kept as an internal overload rather than widening mymod_recordEvent's signature, which is
+// externed from files.cpp and actmonster.cpp and would drag two upstream files along with it.
+static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum, int floor,
+                                   uint32_t about);
+
 // Which player leads this monster? Prefers monsterAllyIndex (replicated as skill[42]),
 // falls back to leader_uid — forceFollower() clears monsterAllyIndex before our hook runs,
 // so the fallback is what covers the /friendly + force-recruit path. -1 = no player leader.
@@ -1182,7 +1189,10 @@ void mymod_ambientTick() {
 				for (auto& other : mymod_watch) {
 					if (other.first == it->first || other.second.owner != owner) continue;
 					if (other.second.seenTick != ticks) continue;   // only the living
-					mymod_recordEvent("ally_died", other.first, other.second.raceEnum, currentlevel);
+					// Name the deceased: the service decides whether this death is worth
+					// grieving, and a spy's is not.
+					mymod_recordEventAbout("ally_died", other.first, other.second.raceEnum,
+						currentlevel, it->first);
 				}
 				mymod_log("death: p%d's follower %u died; companions noted it",
 					owner, (unsigned)it->first);
@@ -2080,6 +2090,11 @@ void mymod_playerNote(int pnum, const std::string& text) {
 // HOST ONLY — clients run this code path too (physfsLoadMapFile, actmonster) and must not
 // reach the service; in particular a client firing "new_run" would wipe the host's run state.
 void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor) {
+	mymod_recordEventAbout(etype, uid, raceEnum, floor, 0);
+}
+
+static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum, int floor,
+                                   uint32_t about) {
 	if (!mymod_isHost()) return;
 	if (etype && !strcmp(etype, "new_run")) {
 		mymod_minoWarnAt = 0;   // a pending warning must not follow the party to a new run
@@ -2108,15 +2123,16 @@ void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor)
 		origin = mymod_originName(mymod_originOf(who, &originKey));
 	}
 	uint32_t u = uid;
+	uint32_t ab = about;
 	int fl = floor;
 	std::string server = mymod_ai_server;
-	std::thread([t, r, u, fl, owner, origin, originKey, server]() {
+	std::thread([t, r, u, ab, fl, owner, origin, originKey, server]() {
 		char body[512];
 		snprintf(body, sizeof(body),
 			"{\"event\":\"%s\",\"race\":\"%s\",\"floor\":%d,\"uid\":%u,\"player\":%d,"
-			"\"origin\":\"%s\",\"origin_key\":\"%s\"}",
+			"\"origin\":\"%s\",\"origin_key\":\"%s\",\"about\":%u}",
 			t.c_str(), r.c_str(), fl, (unsigned)u, owner,
-			origin.c_str(), mymod_jsonEscape(originKey).c_str());
+			origin.c_str(), mymod_jsonEscape(originKey).c_str(), (unsigned)ab);
 		std::string resp;
 		mymod_httpPost(server, body, resp);
 	}).detach();
