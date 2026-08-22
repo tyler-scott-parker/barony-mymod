@@ -643,17 +643,22 @@ static int mymod_disarmFloorTraps() {
 	return n;
 }
 
-// ---- A trusted follower heading off the minotaur ------------------------------------------
-// The positive counterpart to sabotage: the best a loyal follower could previously do was hand
-// you a healing potion once a run, while a spy had four distinct ways to cost you the run.
+// ---- Follower favours: the things a good companion does for you --------------------------
+// The positive counterpart to sabotage. Before these, the best a loyal follower could do was
+// hand you a healing potion once a run, while a spy had four separate ways to cost you the run.
 //
-// ⚠ One mechanism covers BOTH sources, because a spy's sabotage creates the same timer entity
-// that level generation does. Watching for the timer rather than hooking the sabotage means a
-// naturally-generated minotaur floor is caught by the same code, in the same beat.
+// One async slot serves them all: the engine notices a situation, asks the service whether the
+// nearest suitable follower acts, and applies the answer. Two so far:
 //
-// Cancelling is the game's own move: actMinotaurTimer ends itself with list_RemoveNode when it
-// is finished (monster_minotaur.cpp:819), so removing the node early is the supported way to
-// stop a countdown rather than a hack.
+//   minotaur -- cancels a countdown, whether a spy started it or level generation did. Watching
+//               for the TIMER rather than hooking the sabotage is what makes both cases one
+//               piece of code. Cancelling is the game's own move: actMinotaurTimer ends itself
+//               with list_RemoveNode when finished (monster_minotaur.cpp:819).
+//   sokoban  -- solves the boulder puzzle. Remove the boulders and call the game's own
+//               boulderSokobanOnDestroy(false); it destroys a handful of gold bags (a follower
+//               is not as careful as you would be), then finds no boulders, declares it solved
+//               and reveals the artifact gloves. The remaining gold un-hides itself the next
+//               frame (actgold.cpp:44). No reward is spawned by us at all.
 static void mymod_broadcastLine(uint32_t speakerUID, const std::string& prefix,
                                 const std::string& text);   // defined below
 
@@ -661,13 +666,15 @@ static uint32_t mymod_minoWarnAt = 0;      // 0 = nothing pending
 static uint32_t mymod_minoWarn2At = 0;
 static int      mymod_minoSpeech = 0;
 
-static bool mymod_minoGuardUsed = false;    // once per RUN -- not a free pass on every floor
-static int  mymod_minoGuardLevel = -1;      // asked about this floor already
-static std::atomic<bool> mymod_minoGuardBusy{false};
-static std::mutex mymod_minoGuardMutex;
-static std::string mymod_minoGuardLine;     // the follower's line, handed to the main thread
-static uint32_t mymod_minoGuardWho = 0;     // whose head it goes over
-static bool mymod_minoGuardCancel = false;
+static std::atomic<bool> mymod_favourBusy{false};
+static std::mutex        mymod_favourMutex;
+static std::string       mymod_favourLine;     // handed to the main thread
+static std::string       mymod_favourKind;
+static uint32_t          mymod_favourWho = 0;
+static bool              mymod_favourDo  = false;
+static bool mymod_minoGuardUsed = false;       // once per RUN each -- not a free pass
+static bool mymod_sokobanDone   = false;
+static int  mymod_favourAskedLevel = -1;       // ask at most once per floor
 
 static Entity* mymod_findMinotaurTimer() {
 	if (!map.entities) return nullptr;
@@ -678,8 +685,8 @@ static Entity* mymod_findMinotaurTimer() {
 	return nullptr;
 }
 
-// The follower best placed to notice: alive, nearby, and not the one who just caused it.
-static Entity* mymod_guardCandidate(int& outOwner) {
+// The follower best placed to act: alive, nearest to their player, and not a machine.
+static Entity* mymod_favourCandidate(int& outOwner) {
 	Entity* best = nullptr;
 	double bestDist = 1e18;
 	outOwner = -1;
@@ -700,63 +707,87 @@ static Entity* mymod_guardCandidate(int& outOwner) {
 	return best;
 }
 
-static void mymod_guardFetch(uint32_t uid, const std::string& race, int owner) {
-	mymod_minoGuardBusy.store(true);
+static void mymod_favourFetch(const char* kind, uint32_t uid, const std::string& race, int owner) {
+	mymod_favourBusy.store(true);
 	char payload[512];
 	snprintf(payload, sizeof(payload),
-		"{\"minotaur_guard\":true,\"uid\":%u,\"race\":\"%s\",\"floor\":%d,"
+		"{\"favour\":\"%s\",\"uid\":%u,\"race\":\"%s\",\"floor\":%d,"
 		"\"player\":%d,\"map\":\"%s\"}",
-		(unsigned)uid, race.c_str(), currentlevel, owner,
+		kind, (unsigned)uid, race.c_str(), currentlevel, owner,
 		mymod_jsonEscape(map.name).c_str());
-	std::string body = payload, server = mymod_ai_server;
-	std::thread([body, server, uid]() {
+	std::string body = payload, server = mymod_ai_server, k = kind;
+	std::thread([body, server, uid, k]() {
 		std::string resp;
 		mymod_httpPost(server, body, resp);
 		{
-			std::lock_guard<std::mutex> lk(mymod_minoGuardMutex);
-			mymod_minoGuardLine = mymod_jsonField(resp, "reply");
-			mymod_minoGuardCancel = (mymod_jsonField(resp, "guard") == "1");
-			mymod_minoGuardWho = uid;
+			std::lock_guard<std::mutex> lk(mymod_favourMutex);
+			mymod_favourLine = mymod_jsonField(resp, "reply");
+			mymod_favourDo   = (mymod_jsonField(resp, "act") == "1");
+			mymod_favourWho  = uid;
+			mymod_favourKind = k;
 		}
-		mymod_minoGuardBusy.store(false);
+		mymod_favourBusy.store(false);
 	}).detach();
 }
 
-static void mymod_minotaurGuardTick() {
+// Remove every boulder, then let the game declare its own puzzle solved.
+static void mymod_solveSokoban() {
+	if (!map.entities) return;
+	int n = 0;
+	for (node_t* nd = map.entities->first; nd != NULL; ) {
+		Entity* e = (Entity*)nd->element;
+		nd = nd->next;
+		if (e && e->behavior == &actBoulder && e->mynode) { list_RemoveNode(e->mynode); ++n; }
+	}
+	boulderSokobanOnDestroy(false);   // costs a few gold bags, then solves and reveals the prize
+	mymod_log("favour: follower cleared %d boulder(s) and solved Sokoban", n);
+}
+
+static void mymod_favourTick() {
 	// Deliver a finished answer first.
-	std::string line; uint32_t who = 0; bool cancel = false;
+	std::string line, kind; uint32_t who = 0; bool act = false;
 	{
-		std::lock_guard<std::mutex> lk(mymod_minoGuardMutex);
-		if (!mymod_minoGuardLine.empty() || mymod_minoGuardCancel) {
-			line.swap(mymod_minoGuardLine);
-			who = mymod_minoGuardWho;
-			cancel = mymod_minoGuardCancel;
-			mymod_minoGuardCancel = false;
-			mymod_minoGuardWho = 0;
+		std::lock_guard<std::mutex> lk(mymod_favourMutex);
+		if (!mymod_favourLine.empty() || mymod_favourDo) {
+			line.swap(mymod_favourLine);
+			kind.swap(mymod_favourKind);
+			who = mymod_favourWho;
+			act = mymod_favourDo;
+			mymod_favourDo = false;
+			mymod_favourWho = 0;
 		}
 	}
-	if (cancel) {
+	if (act && kind == "minotaur") {
 		if (Entity* t = mymod_findMinotaurTimer()) {
-			list_RemoveNode(t->mynode);        // the game's own way of ending the countdown
+			list_RemoveNode(t->mynode);
 			mymod_minoGuardUsed = true;
-			mymod_minoWarnAt = mymod_minoWarn2At = 0;   // and no warning about a threat that is gone
-			mymod_log("guard: follower %u headed off the minotaur on floor %d",
+			mymod_minoWarnAt = mymod_minoWarn2At = 0;   // nothing gloats about a threat that is gone
+			mymod_log("favour: follower %u headed off the minotaur on floor %d",
 				(unsigned)who, currentlevel);
 		}
+	} else if (act && kind == "sokoban") {
+		mymod_sokobanDone = true;
+		mymod_solveSokoban();
 	}
-	if (!line.empty()) {
-		mymod_broadcastLine(who, "", line);
-	}
+	if (!line.empty()) mymod_broadcastLine(who, "", line);
 
-	if (mymod_minoGuardUsed || mymod_minoGuardBusy.load()) return;
-	if (intro || !map.entities || currentlevel == mymod_minoGuardLevel) return;
-	if (!mymod_findMinotaurTimer()) return;      // nothing counting down
-	mymod_minoGuardLevel = currentlevel;         // ask once per floor, whatever the answer
+	if (mymod_favourBusy.load() || intro || !map.entities) return;
+	if (currentlevel == mymod_favourAskedLevel) return;
+
+	const char* want = nullptr;
+	if (!mymod_minoGuardUsed && mymod_findMinotaurTimer()) {
+		want = "minotaur";
+	} else if (!mymod_sokobanDone && !strncmp(map.name, "Sokoban", 7)) {
+		want = "sokoban";
+	}
+	if (!want) return;
+	mymod_favourAskedLevel = currentlevel;      // ask once per floor, whatever the answer
 
 	int owner = -1;
-	Entity* g = mymod_guardCandidate(owner);
+	Entity* g = mymod_favourCandidate(owner);
 	if (!g || owner < 0) return;
-	mymod_guardFetch(g->getUID(), getMonsterLocalizedName(g->getRace(), g->getStats()), owner);
+	mymod_favourFetch(want, g->getUID(),
+		getMonsterLocalizedName(g->getRace(), g->getStats()), owner);
 }
 
 // ---- Spy sabotage: rigging the floor's traps ---------------------------------------------
@@ -2216,7 +2247,8 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		mymod_rigged.clear();
 		mymod_riggedLevel = -1;
 		mymod_minoGuardUsed = false;
-		mymod_minoGuardLevel = -1;
+		mymod_sokobanDone = false;
+		mymod_favourAskedLevel = -1;
 		for (int c = 0; c < MAXPLAYERS; ++c) { mymod_partner[c] = 0; mymod_shopLine[c].clear(); }
 		mymod_watch.clear();
 		mymod_hurtCooldown.clear();
@@ -2295,7 +2327,7 @@ void mymod_pollAI() {
 	}
 	mymod_minotaurWarningTick();
 	mymod_riggedTrapTick();
-	mymod_minotaurGuardTick();
+	mymod_favourTick();
 	mymod_syncFriendly();   // no-op unless /friendly changed or a client just joined
 	mymod_ambientTick();
 	for (int slot = 0; slot < MYMOD_MAX_SLOTS; ++slot) {
