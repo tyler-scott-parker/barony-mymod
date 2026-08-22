@@ -730,17 +730,65 @@ static void mymod_favourFetch(const char* kind, uint32_t uid, const std::string&
 	}).detach();
 }
 
-// Remove every boulder, then let the game declare its own puzzle solved.
+// ⚠ Boulders are broken up ONE AT A TIME, with the game's own crumble sound and rock particles.
+// Removing them all in a single frame emptied the room instantly and silently, which reads as a
+// glitch rather than as a companion doing something. Staggering it also lets their line land
+// first, so the sequence is: they say they will deal with it, then you hear it happen.
+//
+// Breaking rather than pushing is deliberate. The game's correct solve is a boulder falling into
+// a pit (actboulder.cpp:876), which destroys no gold -- but making them fall would drop them
+// wherever they stand rather than into a pit, which looks worse than breaking them. Breaking is
+// also what justifies the gold cost: boulderSokobanOnDestroy(false) knocks 5-8 bags in, so you
+// get the gloves and most of the gold but not the perfect-solve credit.
+//
+// ⚠ We must NOT let the game's own boulder-destroyed path run here: on Sokoban it spawns a
+// scorpion or insectoid per boulder (actboulder.cpp:609). Removing the node ourselves and
+// calling boulderSokobanOnDestroy once at the end skips that entirely.
+static const uint32_t MYMOD_SOKOBAN_INTERVAL = 12;   // ~0.25s between boulders
+static std::vector<uint32_t> mymod_sokobanQueue;
+static uint32_t mymod_sokobanNextAt = 0;
+// The floor it was queued on. Leaving mid-smash would otherwise leave stale uids that all pop
+// in one tick and then call the solve on the wrong floor -- harmless, because
+// boulderSokobanOnDestroy checks map.name itself, but only by luck.
+static int mymod_sokobanLevel = -1;
+
 static void mymod_solveSokoban() {
+	mymod_sokobanQueue.clear();
 	if (!map.entities) return;
-	int n = 0;
-	for (node_t* nd = map.entities->first; nd != NULL; ) {
+	for (node_t* nd = map.entities->first; nd != NULL; nd = nd->next) {
 		Entity* e = (Entity*)nd->element;
-		nd = nd->next;
-		if (e && e->behavior == &actBoulder && e->mynode) { list_RemoveNode(e->mynode); ++n; }
+		if (e && e->behavior == &actBoulder) mymod_sokobanQueue.push_back(e->getUID());
 	}
-	boulderSokobanOnDestroy(false);   // costs a few gold bags, then solves and reveals the prize
-	mymod_log("favour: follower cleared %d boulder(s) and solved Sokoban", n);
+	mymod_sokobanNextAt = ticks + MYMOD_SOKOBAN_INTERVAL;
+	mymod_sokobanLevel = currentlevel;
+	mymod_log("favour: follower is breaking up %d boulder(s) on Sokoban",
+		(int)mymod_sokobanQueue.size());
+}
+
+static void mymod_sokobanTick() {
+	if (mymod_sokobanQueue.empty()) return;
+	if (currentlevel != mymod_sokobanLevel) {
+		mymod_sokobanQueue.clear();     // left the floor; abandon the rest
+		return;
+	}
+	if (ticks < mymod_sokobanNextAt) return;
+	mymod_sokobanNextAt = ticks + MYMOD_SOKOBAN_INTERVAL;
+	while (!mymod_sokobanQueue.empty()) {
+		Entity* e = uidToEntity(mymod_sokobanQueue.back());
+		mymod_sokobanQueue.pop_back();
+		if (!e || e->behavior != &actBoulder || !e->mynode) continue;   // already gone
+		createParticleRock(e, 78);
+		if (multiplayer == SERVER) serverSpawnMiscParticles(e, PARTICLE_EFFECT_ABILITY_ROCK, 78);
+		playSoundEntity(e, 67, 128);        // the game's own boulder-crumble
+		list_RemoveNode(e->mynode);
+		break;                              // one per interval
+	}
+	if (mymod_sokobanQueue.empty()) {
+		// Last one. Now the game can find no boulders, declare it solved, take its handful of
+		// gold and reveal the gloves.
+		boulderSokobanOnDestroy(false);
+		mymod_log("favour: Sokoban solved");
+	}
 }
 
 static void mymod_favourTick() {
@@ -2248,6 +2296,7 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		mymod_riggedLevel = -1;
 		mymod_minoGuardUsed = false;
 		mymod_sokobanDone = false;
+		mymod_sokobanQueue.clear();
 		mymod_favourAskedLevel = -1;
 		for (int c = 0; c < MAXPLAYERS; ++c) { mymod_partner[c] = 0; mymod_shopLine[c].clear(); }
 		mymod_watch.clear();
@@ -2328,6 +2377,7 @@ void mymod_pollAI() {
 	mymod_minotaurWarningTick();
 	mymod_riggedTrapTick();
 	mymod_favourTick();
+	mymod_sokobanTick();
 	mymod_syncFriendly();   // no-op unless /friendly changed or a client just joined
 	mymod_ambientTick();
 	for (int slot = 0; slot < MYMOD_MAX_SLOTS; ++slot) {
