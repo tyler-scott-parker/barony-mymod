@@ -17,6 +17,7 @@
 #include "../collision.hpp"
 #include "../interface/interface.hpp"
 #include "../shops.hpp"
+#include "../magic/magic.hpp"   // spell_magicMap, for the map boon
 #include "../messages.hpp"
 #include "mymod.hpp"
 #include <thread>
@@ -1087,6 +1088,20 @@ static void mymod_applyBoon(const std::string& payload, Entity* giver) {
 	if (payload.rfind("traps:", 0) == 0) {
 		int n = mymod_disarmFloorTraps();
 		mymod_log("boon: follower disarmed %d trap(s) on floor %d", n, currentlevel);
+		return;
+	}
+	// ⚠ The whole floor, not a radius. spell_magicMap already handles multiplayer itself --
+	// it sends an 'MMAP' packet to a remote client (magic.cpp:70) -- so a client's own minimap
+	// fills in with no netcode of ours. radius 0 means every tile (maps.cpp:11002); the scroll
+	// of magic mapping uses 16+8*beatitude, so this is deliberately stronger than the scroll
+	// and gated to once per run to match.
+	if (payload.rfind("map:", 0) == 0 && giver) {
+		const int owner = mymod_ownerOf(giver);
+		if (owner >= 0 && players[owner] && players[owner]->entity) {
+			spell_magicMap(owner, 0,
+				(int)(players[owner]->entity->x / 16), (int)(players[owner]->entity->y / 16));
+			mymod_log("boon: follower mapped the whole of floor %d for p%d", currentlevel, owner);
+		}
 		return;
 	}
 	if (payload.rfind("item:", 0) == 0 && giver) {
