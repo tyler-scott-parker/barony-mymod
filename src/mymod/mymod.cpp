@@ -218,6 +218,50 @@ void mymod_netClientRecvName() {
 	}
 }
 
+// --- '/friendly' replication ('MYFR') ---------------------------------------
+//
+// everybodyfriendly is a host-local global: vanilla never puts it on the wire, and /friendly
+// itself refuses to run on a client. Monster AI is host-authoritative so they behave correctly,
+// but the CLIENT decides for itself whether a monster is interactable -- and its copy of the
+// flag is always false. The result is that a client can walk up to a pacified monster, see it
+// ignore them, and get no interact prompt at all: only the host can recruit. See the matching
+// comment in monsterIsFriendlyForTooltip() (player.cpp), which is the other half of this fix.
+//
+// This is a TEST-HARNESS fix. /summonall + /friendly is how this mod is exercised, and without
+// it none of the co-op paths can be reached with the harness.
+//
+// Pushed by polling rather than by hooking /friendly, so a client that joins AFTER the toggle
+// is brought in sync too -- and so consolecommand.cpp needs no edit at all.
+static bool mymod_friendlySent[MAXPLAYERS]  = { false };
+static bool mymod_friendlyValue[MAXPLAYERS] = { false };
+
+static void mymod_syncFriendly() {
+	if (multiplayer != SERVER || !net_packet || !net_packet->data) return;
+	for (int c = 1; c < MAXPLAYERS; ++c) {
+		if (client_disconnected[c] || players[c]->isLocalPlayer()) {
+			mymod_friendlySent[c] = false;   // resend if they reconnect
+			continue;
+		}
+		if (mymod_friendlySent[c] && mymod_friendlyValue[c] == everybodyfriendly) continue;
+		strcpy((char*)net_packet->data, "MYFR");
+		net_packet->data[4] = everybodyfriendly ? 1 : 0;
+		net_packet->address.host = net_clients[c - 1].host;
+		net_packet->address.port = net_clients[c - 1].port;
+		net_packet->len = 5;
+		sendPacketSafe(net_sock, -1, net_packet, c - 1);
+		mymod_friendlySent[c]  = true;
+		mymod_friendlyValue[c] = everybodyfriendly;
+		mymod_log("net: MYFR -> p%d everybodyfriendly=%d", c, everybodyfriendly ? 1 : 0);
+	}
+}
+
+// CLIENT: adopt the host's /friendly state so tooltips and interaction agree with the host.
+// Registered as 'MYFR'.
+void mymod_netClientRecvFriendly() {
+	if (!net_packet || !net_packet->data) return;
+	everybodyfriendly = (net_packet->data[4] != 0);
+}
+
 // =============================================================================
 //  INPUT
 // =============================================================================
@@ -1371,6 +1415,7 @@ void mymod_pollAI() {
 	if (!mymod_isHost()) {
 		return;   // clients receive dialogue as vanilla MSGS/BUBL packets; nothing to poll
 	}
+	mymod_syncFriendly();   // no-op unless /friendly changed or a client just joined
 	mymod_ambientTick();
 	for (int slot = 0; slot < MYMOD_MAX_SLOTS; ++slot) {
 		mymod_deliverSlot(slot);

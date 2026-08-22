@@ -32,6 +32,7 @@ void mymod_netClientRecvName();   // 'MYNM'  host -> client: a follower named it
 void mymod_netClientRecvShopLine();// 'MYSH'  host -> client: a merchant's line for the shop window
 void mymod_netServerRecvIdentify();       // 'MYID'  client -> host: item it wants identified
 void mymod_netClientRecvIdentifyVerdict();// 'MYIV'  host -> client: was the claim true?
+void mymod_netClientRecvFriendly();       // 'MYFR'  host -> client: /friendly state (test harness)
 
 // --- non-follower NPCs (townsfolk, merchants, named characters) ---
 // Called when a player engages an NPC: from handleMonsterChatter (clicking a talking NPC)

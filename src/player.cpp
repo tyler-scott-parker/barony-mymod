@@ -3364,6 +3364,16 @@ bool monsterIsFriendlyForTooltip(const int player, Entity& entity)
 	{
 		return false;
 	}
+	// MYMOD: the checkEnemy() shortcut below is skipped on clients, and it is the only thing
+	// here that reads everybodyfriendly -- so a client falls through to the static
+	// monsterally[][] table, reads every /summonall'd monster as hostile, is offered no
+	// interact tooltip, and can never recruit. (The host is unaffected, which is why this
+	// only ever showed up in co-op.) The mod replicates the flag itself over 'MYFR'; this
+	// makes the client act on it, exactly as checkFriend()/checkEnemy() already do.
+	if ( everybodyfriendly || intro )
+	{
+		return true;
+	}
 	if ( multiplayer != CLIENT )
 	{
 		if ( !entity.checkEnemy(players[player]->entity) )

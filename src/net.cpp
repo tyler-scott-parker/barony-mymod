@@ -6332,6 +6332,9 @@ static std::unordered_map<Uint32, void(*)()> clientPacketHandlers = {
 	// MYMOD: verdict on an item this client asked its follower to identify
 	{'MYIV', [](){ mymod_netClientRecvIdentifyVerdict(); }},
 
+	// MYMOD: the host's /friendly state, which vanilla never replicates (test harness)
+	{'MYFR', [](){ mymod_netClientRecvFriendly(); }},
+
 	// text bubbles
 	{'BUBL', []() {
 		Uint32 uid = SDLNet_Read32(&net_packet->data[4]);
