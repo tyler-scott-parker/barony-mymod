@@ -27,6 +27,7 @@
 #include <cstring>
 #include <cstdarg>
 #include <map>
+#include <set>
 #include <unordered_map>
 #include <SDL.h>
 
@@ -90,11 +91,75 @@ static std::map<uint32_t, uint32_t> mymod_fightCooldown;   // follower uid -> la
 // player literally typing a threat, so the interesting relationship tensions were
 // unreachable in play. Everything here rides the follower scan that already runs every
 // frame, so only friendly fire needed a new upstream hook.
+// ---- Where a follower CAME FROM -------------------------------------------------------
+// Conjurer summons, mesmer charms and machinist bots are all followers, but they arrive by
+// mechanisms that create and DESTROY them as normal use of the class -- and every social
+// system here was built for a creature you recruited once and kept.
+//
+// Gate on ORIGIN, never on the player's class: any caster can learn SPELL_SUMMON, a charm
+// scroll works for anybody, and a sentrybot found on the floor can be thrown by a barbarian.
+// Shaman earth-elemental summons carry a summon rank too, so origin picks those up for free.
+enum MymodOrigin {
+	MYMOD_ORIGIN_NONE = 0,
+	MYMOD_ORIGIN_SUMMON,    // monsterAllySummonRank, skill[50] -- replicated
+	MYMOD_ORIGIN_CHARMED,   // Stat->monsterIsCharmed, MISC_FLAGS[12] -- host-side only
+	MYMOD_ORIGIN_BOT,       // gyro/dummy/sentry/spellbot, by sprite
+};
+
+static const char* mymod_originName(int o) {
+	switch (o) {
+		case MYMOD_ORIGIN_SUMMON:  return "summon";
+		case MYMOD_ORIGIN_CHARMED: return "charmed";
+		case MYMOD_ORIGIN_BOT:     return "bot";
+		default:                   return "";
+	}
+}
+
+// keyOut receives the part of the identity that OUTLIVES this particular body, so the
+// service can rebind an old relationship to a new uid. Empty for charmed and recruited
+// followers, which are ordinary dungeon creatures and only ever have one body.
+static int mymod_originOf(Entity* e, std::string* keyOut = nullptr) {
+	if (keyOut) { keyOut->clear(); }
+	if (!e || e->behavior != &actMonster) return MYMOD_ORIGIN_NONE;
+	Stat* s = e->getStats();
+	if (!s) return MYMOD_ORIGIN_NONE;
+	// Bots first: a tinkering creation never carries a summon rank, and the test is on the
+	// sprite rather than on any stat that deploying might not have set yet.
+	if (e->monsterIsTinkeringCreation()) {
+		if (keyOut) { *keyOut = getMonsterLocalizedName(s->type, s); }
+		return MYMOD_ORIGIN_BOT;
+	}
+	if (e->monsterAllySummonRank != 0) {
+		// The slot the ENGINE itself uses: "skeleton knight" is the playerSummon* set,
+		// "skeleton sentinel" is playerSummon2*, and their LVL/HP/stats persist per slot
+		// across every recast (monster_skeleton.cpp:82). Read the ATTRIBUTE, not Stat->name --
+		// the name is what nameMatchesSpecialNPCName compares, and is exactly what we must
+		// not disturb.
+		if (keyOut) {
+			*keyOut = s->getAttribute("special_npc");
+			if (keyOut->empty()) { *keyOut = getMonsterLocalizedName(s->type, s); }
+		}
+		return MYMOD_ORIGIN_SUMMON;
+	}
+	if (s->monsterIsCharmed == 1) return MYMOD_ORIGIN_CHARMED;
+	return MYMOD_ORIGIN_NONE;
+}
+
+// A follower whose Stat->name the engine reads back as identity. Renaming one of these is
+// not cosmetic: nameMatchesSpecialNPCName (monster_shared.cpp:569) compares Stat->name
+// directly, so an AI-chosen name makes a skeleton knight stop being one.
+static bool mymod_nameIsLoadBearing(Entity* e) {
+	if (!e) return false;
+	Stat* s = e->getStats();
+	return s && !s->getAttribute("special_npc").empty();
+}
+
 struct MymodFollowerWatch {
 	int      lastHP   = -1;
 	int      maxHP    = 0;
 	int      owner    = -1;
 	int      raceEnum = 0;
+	int      origin   = MYMOD_ORIGIN_NONE;   // captured while alive; a corpse cannot be asked
 	uint32_t seenTick = 0;
 	uint32_t farSince = 0;   // when they first fell too far behind (0 = they are with you)
 	uint32_t lastWound = 0, lastHeal = 0, lastFar = 0;
@@ -425,6 +490,7 @@ void mymod_ambientTick() {
 			const int prevMax = w.maxHP;          // capture BEFORE overwriting; see level-up guard
 			w.owner = owner;
 			w.raceEnum = (int)fe->getRace();
+			w.origin = mymod_originOf(fe);
 			w.seenTick = ticks;
 			// A LEVEL-UP raises MAXHP and restores HP. Without this guard that reads as a big
 			// heal, and the follower thanks the player for something they did not do.
@@ -504,6 +570,22 @@ void mymod_ambientTick() {
 				// the loop above while still standing there. Only mourn a body that is really
 				// gone from the world.
 				if (uidToEntity(it->first) != nullptr) { it = mymod_watch.erase(it); continue; }
+				// ...and neither is a summon or a bot LEAVING. Recasting SUMMON kills the old
+				// pair outright (actmagic.cpp:14288 sets their HP to 0), and retrieving a
+				// sentrybot kills it to fold it back into the item (monster_sentrybot.cpp:521).
+				// Both really do leave the world, so the sweep above cannot tell them from a
+				// death -- and a conjurer recasting their signature spell was inflicting
+				// -trust/+fear/+resentment on the whole party, silently, every single time.
+				// The engine draws the same line the other way round: it sets skipObituary for
+				// exactly these (actmonster.cpp:3905), because it knows they are not deaths.
+				// A summon genuinely slain in combat is therefore not mourned either; that is
+				// the deliberate trade, and it is the rarer half by a wide margin.
+				if (it->second.origin == MYMOD_ORIGIN_SUMMON || it->second.origin == MYMOD_ORIGIN_BOT) {
+					mymod_log("dismissed: p%d's %s %u left the world; not mourned",
+						it->second.owner, mymod_originName(it->second.origin), (unsigned)it->first);
+					it = mymod_watch.erase(it);
+					continue;
+				}
 				const int owner = it->second.owner;
 				// Tell this player's OTHER followers what they just watched happen.
 				for (auto& other : mymod_watch) {
@@ -765,13 +847,18 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 static std::string mymod_payloadHead(int pnum, const std::string& raceName, uint32_t uid,
                                      const std::string& says) {
 	std::string playerName = (stats[pnum] && stats[pnum]->name[0]) ? stats[pnum]->name : "";
+	// How this follower came to be. Sent for every kind of speaker; it is simply empty for
+	// an ordinary recruit, so nothing about normal play changes shape.
+	std::string originKey;
+	const char* origin = mymod_originName(mymod_originOf(uidToEntity(uid), &originKey));
 	char buf[1024];
 	snprintf(buf, sizeof(buf),
 		"\"race\":\"%s\",\"floor\":%d,\"map\":\"%s\",\"says\":\"%s\",\"uid\":%u,"
-		"\"player\":%d,\"player_name\":\"%s\"",
+		"\"player\":%d,\"player_name\":\"%s\",\"origin\":\"%s\",\"origin_key\":\"%s\"",
 		raceName.c_str(), currentlevel, mymod_jsonEscape(map.name).c_str(),
 		mymod_jsonEscape(says).c_str(), (unsigned)uid,
-		pnum, mymod_jsonEscape(playerName).c_str());
+		pnum, mymod_jsonEscape(playerName).c_str(),
+		origin, mymod_jsonEscape(originKey).c_str());
 	return std::string(buf);
 }
 
@@ -1229,7 +1316,23 @@ static void mymod_deliverSlot(int slot) {
 		cv.ident.clear();
 	}
 	// Set the follower's given name (renames the party HUD; GameUI reads Stat->name).
-	if (follower && !gname.empty() && follower->getStats()
+	//
+	// ⚠ NOT for a follower whose name the engine reads back as identity. A conjurer's
+	// skeleton knight is recognised by nameMatchesSpecialNPCName comparing Stat->name
+	// (monster_shared.cpp:569); rename it and monster_skeleton.cpp:66 stops matching, falls
+	// through to secondarySummon, and the knight reads and then OVERWRITES the sentinel's
+	// stat slot -- so both summons collapse onto slot 2 and slot 1's progression is lost.
+	// The AI-chosen name still lives service-side and still shows in speech; only the
+	// engine's copy is left alone.
+	if (follower && !gname.empty() && mymod_nameIsLoadBearing(follower)) {
+		static std::set<uint32_t> logged;   // once per creature, not once per line
+		if (logged.insert(cv.follower_uid).second) {
+			mymod_log("named: p%d's follower %u keeps the engine name '%s' (AI name '%s' is "
+				"display-only -- Stat->name is load-bearing here)",
+				pnum, (unsigned)cv.follower_uid,
+				follower->getStats() ? follower->getStats()->name : "?", gname.c_str());
+		}
+	} else if (follower && !gname.empty() && follower->getStats()
 		&& strcmp(follower->getStats()->name, gname.c_str()) != 0) {
 		strncpy(follower->getStats()->name, gname.c_str(), 127);
 		follower->getStats()->name[127] = '\0';
@@ -1371,18 +1474,27 @@ void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor)
 	std::string r = getMonsterLocalizedName((Monster)raceEnum);
 	if (r.empty()) r = "monster";
 	int owner = 0;
+	std::string originKey;
+	std::string origin;
 	if (uid) {
-		int o = mymod_ownerOf(uidToEntity(uid));
+		Entity* who = uidToEntity(uid);
+		int o = mymod_ownerOf(who);
 		if (o >= 0) owner = o;
+		// Resolved HERE, while the body still exists. Recruitment is the moment a summon or
+		// a bot rebinds to whatever relationship its predecessor built, so the key has to
+		// ride along with the event that creates the state.
+		origin = mymod_originName(mymod_originOf(who, &originKey));
 	}
 	uint32_t u = uid;
 	int fl = floor;
 	std::string server = mymod_ai_server;
-	std::thread([t, r, u, fl, owner, server]() {
+	std::thread([t, r, u, fl, owner, origin, originKey, server]() {
 		FILE* pf = fopen("/tmp/mymod_event.json", "w");
 		if (pf) {
-			fprintf(pf, "{\"event\":\"%s\",\"race\":\"%s\",\"floor\":%d,\"uid\":%u,\"player\":%d}",
-				t.c_str(), r.c_str(), fl, (unsigned)u, owner);
+			fprintf(pf, "{\"event\":\"%s\",\"race\":\"%s\",\"floor\":%d,\"uid\":%u,\"player\":%d,"
+				"\"origin\":\"%s\",\"origin_key\":\"%s\"}",
+				t.c_str(), r.c_str(), fl, (unsigned)u, owner,
+				origin.c_str(), mymod_jsonEscape(originKey).c_str());
 			fclose(pf);
 		}
 		char cmd[512];
