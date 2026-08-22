@@ -26,6 +26,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdarg>
+#include <deque>
 #include <map>
 #include <set>
 #include <unordered_map>
@@ -435,7 +436,7 @@ static void mymod_applyBoon(const std::string& payload, Entity* giver) {
 //  AMBIENT / TAUNTS  (host only — one shared world channel)
 // =============================================================================
 
-// Fire an ambient/taunt generation on the world slot. The taunt and babble paths
+// Fire an ambient/taunt generation on the world slot.// Fire an ambient/taunt generation on the world slot. The taunt and babble paths
 // differ ONLY in the JSON body, so both go through here.
 static void mymod_asyncAmbient(const std::string& payload) {
 	MymodConvo& cv = mymod_convo[MYMOD_WORLD_SLOT];
@@ -480,8 +481,137 @@ static std::string mymod_polymorphRace(int pnum) {
 	return getMonsterLocalizedName((Monster)form);
 }
 
+// ---- The dummybot heckler ------------------------------------------------------------
+// A dummybot is a sprung training dummy thrown into a dungeon so things shoot at it instead
+// of at the tinkerer -- its combat value IS being noticed (monsters spot one from 96 units,
+// actmonster.cpp:6115). So it heckles. Constantly. At everything.
+//
+// ⚠ Lines come in MAGAZINES, not one generation per shout. Rapid-fire is the whole joke and a
+// generation is 1-4s, so a per-line request would either stutter or eat the GPU that real
+// dialogue needs. One call returns a batch, this fires them locally at no cost, and a refill
+// goes out only when the magazine runs low -- and only while no player is mid-conversation,
+// so dialogue keeps priority.
+static const uint32_t MYMOD_HECKLE_INTERVAL = 60;                    // ~1.2s between shouts
+static const double   MYMOD_HECKLE_RANGE_SQ = (10.0 * 16) * (10.0 * 16);
+static const int      MYMOD_HECKLE_BATCH    = 12;
+static const size_t   MYMOD_HECKLE_LOW      = 5;                     // refill at ~6s left
+
+static std::deque<std::string>  mymod_heckleMag;
+static std::vector<std::string> mymod_heckleIncoming;
+static std::string              mymod_heckleRace;     // who the magazine was written for
+static std::mutex               mymod_heckleMutex;
+static std::atomic<bool>        mymod_heckleInflight{false};
+static std::atomic<bool>        mymod_heckleReady{false};
+static uint32_t                 mymod_nextHeckle = 0;
+
+// Bubble without a chat line. The shared feed carries the actual conversation, and a heckler
+// firing every 1.2s would push real dialogue off the screen inside one fight -- at which point
+// it stops being funny. mymod_broadcastLine uses this for the bubble half.
+static void mymod_broadcastBubble(uint32_t speakerUID, const std::string& text) {
+	if (speakerUID == 0) return;
+	for (int c = 0; c < MAXPLAYERS; ++c) {
+		if (client_disconnected[c] || !players[c]) continue;
+		// "%s" as the format string guards against stray % in AI text (printf-style).
+		players[c]->worldUI.worldTooltipDialogue.createDialogueTooltip(
+			speakerUID, Player::WorldUI_t::WorldTooltipDialogue_t::DIALOGUE_NPC,
+			"%s", text.c_str());
+	}
+}
+
+static void mymod_heckleFetch(const std::string& race) {
+	mymod_heckleInflight.store(true);
+	char payload[512];
+	std::string pform = mymod_polymorphRace(clientnum);
+	snprintf(payload, sizeof(payload),
+		"{\"heckle\":true,\"race\":\"%s\",\"floor\":%d,\"count\":%d,\"player_race\":\"%s\"}",
+		race.c_str(), currentlevel, MYMOD_HECKLE_BATCH, mymod_jsonEscape(pform).c_str());
+	std::string body = payload, server = mymod_ai_server;
+	std::thread([body, server]() {
+		char cmd[2048];
+		snprintf(cmd, sizeof(cmd),
+			"curl -s %s -X POST -d '%s' > /tmp/mymod_heckle.json 2>/dev/null; "
+			"python3 -c 'import json;print(chr(10).join("
+			"json.load(open(\"/tmp/mymod_heckle.json\")).get(\"lines\",[])))'",
+			server.c_str(), body.c_str());
+		FILE* f = popen(cmd, "r");
+		std::vector<std::string> got;
+		if (f) {
+			char b[512];
+			while (fgets(b, sizeof(b), f)) {
+				std::string s(b);
+				mymod_trimTail(s);
+				if (!s.empty()) got.push_back(s);
+			}
+			pclose(f);
+		}
+		{ std::lock_guard<std::mutex> lk(mymod_heckleMutex); mymod_heckleIncoming = got; }
+		mymod_heckleReady.store(true);
+	}).detach();
+}
+
+// Runs BEFORE the ambient guards, like the fight-survival scan: firing a line costs nothing
+// and must keep happening while somebody is mid-conversation.
+static void mymod_heckleTick() {
+	if (mymod_heckleReady.load()) {
+		std::vector<std::string> got;
+		{ std::lock_guard<std::mutex> lk(mymod_heckleMutex); got.swap(mymod_heckleIncoming); }
+		for (auto& s : got) mymod_heckleMag.push_back(s);
+		mymod_heckleReady.store(false);
+		mymod_heckleInflight.store(false);
+		mymod_log("heckle: magazine +%d line(s) vs %s (%d held)",
+			(int)got.size(), mymod_heckleRace.c_str(), (int)mymod_heckleMag.size());
+	}
+	if (intro || !map.entities) return;
+	if (ticks < mymod_nextHeckle) return;                 // cheap early-out; no scan per frame
+	mymod_nextHeckle = ticks + MYMOD_HECKLE_INTERVAL;
+
+	// Pick one deployed dummybot with something to shout at. Reservoir pick so several bots
+	// take turns instead of the first in map order always winning.
+	Entity* bot = nullptr;
+	Entity* target = nullptr;
+	int seen = 0;
+	for (auto n = map.entities->first; n != NULL; n = n->next) {
+		auto e = (Entity*)n->element;
+		if (e->behavior != &actMonster) continue;
+		if (e->getMonsterTypeFromSprite() != DUMMYBOT) continue;
+		if (mymod_ownerOf(e) < 0) continue;               // someone's, not a wild one
+		Stat* es = e->getStats();
+		if (!es || es->HP <= 0) continue;
+		// Anything hostile close enough to be worth insulting.
+		Entity* near = nullptr;
+		for (auto n2 = map.entities->first; n2 != NULL; n2 = n2->next) {
+			auto o = (Entity*)n2->element;
+			if (o == e || o->behavior != &actMonster) continue;
+			if (mymod_ownerOf(o) >= 0) continue;          // don't heckle the party
+			Stat* os = o->getStats();
+			if (!os || os->HP <= 0) continue;
+			double dx = o->x - e->x, dy = o->y - e->y;
+			if (dx*dx + dy*dy <= MYMOD_HECKLE_RANGE_SQ) { near = o; break; }
+		}
+		if (!near) continue;
+		++seen;
+		if (rand() % seen == 0) { bot = e; target = near; }
+	}
+	if (!bot || !target) return;
+
+	std::string race = getMonsterLocalizedName(target->getRace(), target->getStats());
+	if (!mymod_heckleMag.empty()) {
+		mymod_broadcastBubble(bot->getUID(), mymod_heckleMag.front());
+		mymod_heckleMag.pop_front();
+	}
+	// Refill for whoever it is yelling at NOW. A magazine written for a goblin gets spent on
+	// a rat for a few seconds after the target changes; that is cheaper than throwing lines
+	// away and nobody can tell.
+	if (mymod_heckleMag.size() < MYMOD_HECKLE_LOW
+		&& !mymod_heckleInflight.load() && !mymod_anyPlayerBusy()) {
+		mymod_heckleRace = race;
+		mymod_heckleFetch(race);
+	}
+}
+
 void mymod_ambientTick() {
 	if (!mymod_isHost()) return;
+	mymod_heckleTick();
 	// Fight-survival scan: runs first so combat is tracked every frame, even during
 	// conversations. Covers EVERY player's followers, not just the host's.
 	if (!intro && map.entities) {
@@ -1253,13 +1383,8 @@ static void mymod_broadcastLine(uint32_t speakerUID, const std::string& prefix, 
 		if (client_disconnected[c] || !players[c]) continue;
 		messagePlayerColor(c, MESSAGE_CHAT, makeColorRGB(180, 220, 255), "%s%s",
 			prefix.c_str(), text.c_str());
-		if (speakerUID != 0) {
-			// "%s" as the format string guards against stray % in AI text (printf-style).
-			players[c]->worldUI.worldTooltipDialogue.createDialogueTooltip(
-				speakerUID, Player::WorldUI_t::WorldTooltipDialogue_t::DIALOGUE_NPC,
-				"%s", text.c_str());
-		}
 	}
+	mymod_broadcastBubble(speakerUID, text);   // one place knows the "%s" guard
 }
 
 // Apply one finished generation: boon, rename, broadcast, then the follower command.
