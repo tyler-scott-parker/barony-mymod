@@ -83,3 +83,7 @@ xcode/Barony/Barony.xcodeproj/xcuserdata/*
 *.ilk
 /VS.2015/x64
 *.sqlite-journal
+
+# Adorcism: whisper build tree and models -- never commit a 142 MB model
+build-whisper/
+*.bin

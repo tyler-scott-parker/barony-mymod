@@ -42,3 +42,20 @@ static bool mymod_writeWav(const std::string& path, const std::vector<int16_t>& 
 	return true;
 }
 
+
+// Beside the executable, then a models/ folder, then wherever the player put it. A co-op
+// client should be able to unzip the mod and have this simply work.
+static std::string mymod_whisperModelIn(const std::string& here) {
+	if (const char* env = getenv("ADORCISM_WHISPER_MODEL")) {
+		if (*env) return env;
+	}
+	for (const char* name : {"ggml-base.en.bin", "ggml-tiny.en.bin"}) {
+		for (const std::string& dir : {here, here + "models/", std::string("models/")}) {
+			const std::string p = dir + name;
+			FILE* f = fopen(p.c_str(), "rb");
+			if (f) { fclose(f); return p; }
+		}
+	}
+	return "";
+}
+

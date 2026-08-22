@@ -83,6 +83,31 @@ int main() {
 	}
 	ck("an empty clip still writes a valid header", mymod_writeWav(path, {}));
 	remove(path.c_str());
+
+	// ---- whisper model discovery ----
+	// A co-op client should be able to unzip the mod and have voice work, so the finder has to
+	// look where a person would actually put the file -- and an env override has to win, since
+	// that is the only escape hatch when it does not.
+	unsetenv("ADORCISM_WHISPER_MODEL");
+	const std::string dir = "/tmp/mymod_modeltest/";
+	system("rm -rf /tmp/mymod_modeltest && mkdir -p /tmp/mymod_modeltest/models");
+	ck("nothing found when nothing is there", mymod_whisperModelIn(dir).empty(),
+	   mymod_whisperModelIn(dir));
+	system("touch /tmp/mymod_modeltest/models/ggml-tiny.en.bin");
+	ck("finds a model in models/", mymod_whisperModelIn(dir).find("tiny") != std::string::npos,
+	   mymod_whisperModelIn(dir));
+	system("touch /tmp/mymod_modeltest/ggml-base.en.bin");
+	// base.en is markedly better on this game's proper nouns, so it must win when both exist.
+	ck("prefers base.en beside the binary over tiny.en in models/",
+	   mymod_whisperModelIn(dir).find("base") != std::string::npos, mymod_whisperModelIn(dir));
+	setenv("ADORCISM_WHISPER_MODEL", "/somewhere/else/model.bin", 1);
+	ck("the env override beats everything",
+	   mymod_whisperModelIn(dir) == "/somewhere/else/model.bin", mymod_whisperModelIn(dir));
+	setenv("ADORCISM_WHISPER_MODEL", "", 1);
+	ck("an EMPTY env var is ignored rather than taken literally",
+	   mymod_whisperModelIn(dir).find("base") != std::string::npos, mymod_whisperModelIn(dir));
+	unsetenv("ADORCISM_WHISPER_MODEL");
+	system("rm -rf /tmp/mymod_modeltest");
 	std::cout << "\n" << fails << " failure(s)\n";
 	return fails ? 1 : 0;
 }

@@ -440,11 +440,107 @@ static bool mymod_micOpen() {
 }
 
 #include "mymod_voice.hpp"   // resampler + WAV writer, shared with wavtest.cpp
+#ifdef MYMOD_WHISPER
+#include "whisper.h"        // only when -DADORCISM_WHISPER=ON; see CMakeLists.txt
+#endif
+
+#ifdef MYMOD_WHISPER
+// ---- Local speech-to-text -----------------------------------------------------------------
+// whisper.cpp, in-process. The point is a co-op client needing NOTHING but the mod: no Python,
+// no pip, no CUDA. Measured on this machine with base.en on CPU: model load 0.05s (mmap), then
+// ~0.77s per utterance regardless of its length, which is imperceptible after releasing a key.
+//
+// ⚠ The vocabulary prompt is doing real work, not decoration. Whisper has no prior for this
+// game's proper nouns, and measured on the same clip it turned "Barrenburg is waiting in the
+// mines below Hamlet" into "Baron Herx is waiting in the Mines below Hamlet". Keep it to names
+// the model would otherwise mangle -- it is prepended as context, so length costs decode time.
+static const char* MYMOD_WHISPER_VOCAB =
+	"Barony: Baron Herx, Baphomet, Hamlet, the Mines, the Swamp, the Labyrinth, the Citadel, "
+	"goblin, gnome, kobold, skeleton, troll, succubus, incubus, automaton, minotaur, lich, "
+	"shopkeeper, crystal golem, sentrybot, spellbot, gyrobot, dummybot, myconid, dryad, "
+	"insectoid, scarab, cockatrice, bugbear, goatman, ghoul, imp, salamander, gremlin.";
+
+static struct whisper_context* mymod_whisper = nullptr;
+static bool mymod_whisperTried = false;
+static std::atomic<bool> mymod_whisperBusy{false};
+static std::mutex mymod_whisperTextMutex;
+static std::string mymod_whisperText;      // handed to the main thread by mymod_pollPTT
+
+static bool mymod_whisperOpen() {
+	if (mymod_whisper) return true;
+	if (mymod_whisperTried) return false;
+	mymod_whisperTried = true;
+	char* base = SDL_GetBasePath();
+	const std::string here = base ? base : "./";
+	if (base) SDL_free(base);
+	const std::string path = mymod_whisperModelIn(here);
+	if (path.empty()) {
+		printlog("[MYMOD] voice: no whisper model found. Put ggml-base.en.bin beside the game, "
+			"or set ADORCISM_WHISPER_MODEL.");
+		return false;
+	}
+	whisper_context_params cp = whisper_context_default_params();
+	cp.use_gpu = false;   // the GPU is holding the 8B; this must never compete with generation
+	mymod_whisper = whisper_init_from_file_with_params(path.c_str(), cp);
+	if (!mymod_whisper) {
+		printlog("[MYMOD] voice: could not load whisper model %s", path.c_str());
+		return false;
+	}
+	printlog("[MYMOD] voice: whisper ready (%s)", path.c_str());
+	return true;
+}
+
+// Runs on its own thread: whisper_full blocks for the best part of a second, which is eleven
+// frames. The finished text is left for mymod_pollPTT to collect on the main thread.
+static void mymod_whisperRun(std::vector<int16_t> pcm) {
+	std::vector<float> f32(pcm.size());
+	for (size_t i = 0; i < pcm.size(); ++i) f32[i] = pcm[i] / 32768.0f;
+
+	whisper_full_params p = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+	p.print_progress   = false;
+	p.print_realtime   = false;
+	p.print_special    = false;
+	p.print_timestamps = false;
+	p.no_timestamps    = true;
+	p.single_segment   = true;
+	p.language         = "en";
+	p.initial_prompt   = MYMOD_WHISPER_VOCAB;
+	p.n_threads        = std::max(1u, std::min(4u, std::thread::hardware_concurrency()));
+
+	std::string text;
+	if (whisper_full(mymod_whisper, p, f32.data(), (int)f32.size()) == 0) {
+		for (int i = 0; i < whisper_full_n_segments(mymod_whisper); ++i) {
+			const char* s = whisper_full_get_segment_text(mymod_whisper, i);
+			if (s) text += s;
+		}
+	}
+	mymod_trimTail(text, "\n\r \t");
+	while (!text.empty() && text.front() == ' ') text.erase(text.begin());
+	{
+		std::lock_guard<std::mutex> lk(mymod_whisperTextMutex);
+		mymod_whisperText = text;
+	}
+	mymod_whisperBusy.store(false);
+}
+#endif
 
 // One seam, deliberately. Today it hands the clip to the Python bridge; embedding whisper.cpp
 // means replacing this body and nothing else -- capture, the key handling and the delivery
 // path above and below it all stay put.
 static void mymod_transcribeClip(const std::vector<int16_t>& pcm) {
+#ifdef MYMOD_WHISPER
+	if (mymod_whisperOpen()) {
+		if (mymod_whisperBusy.exchange(true)) {
+			printlog("[MYMOD] voice: still working on the last one");
+			return;
+		}
+		printlog("[MYMOD] voice: %.1fs clip, transcribing...",
+			(double)pcm.size() / MYMOD_MIC_RATE);
+		std::thread(mymod_whisperRun, pcm).detach();
+		return;
+	}
+	// No model on disk: fall through to the bridge rather than losing the utterance.
+#endif
 	// Write-then-rename, the same guard the TTS spool uses: the reader must never catch a
 	// half-written clip and transcribe silence.
 	const std::string wav = mymod_tmpPath("mymod_voice_clip.wav");
@@ -459,8 +555,31 @@ static void mymod_transcribeClip(const std::vector<int16_t>& pcm) {
 		(double)pcm.size() / MYMOD_MIC_RATE);
 }
 
+// One place decides what a finished utterance does, whichever transcriber produced it.
+static void mymod_onTranscribed(std::string vtext) {
+	// Junk filter: needs at least one letter, which skips "", ". . ." and the confident
+	// nonsense every speech model emits when handed silence.
+	bool hasLetter = false;
+	for (char c : vtext) { if ((c>='a'&&c<='z')||(c>='A'&&c<='Z')) { hasLetter = true; break; } }
+	mymod_trimTail(vtext, "\n\r ");
+	if (!hasLetter || vtext.size() < 2) return;
+	messagePlayer(clientnum, MESSAGE_MISC, "[MYMOD] you said: %s", vtext.c_str());
+	mymod_sendToFollower(vtext);
+}
+
 void mymod_pollPTT() {
 	extern std::unordered_map<SDL_Keycode, bool> keystatus;
+#ifdef MYMOD_WHISPER
+	// In-process result, handed over by the worker thread.
+	if (!mymod_busy(clientnum)) {
+		std::string got;
+		{
+			std::lock_guard<std::mutex> lk(mymod_whisperTextMutex);
+			got.swap(mymod_whisperText);
+		}
+		if (!got.empty()) mymod_onTranscribed(got);
+	}
+#endif
 	// Voice result: if the bridge dropped transcribed text, feed it to the follower.
 	if (!mymod_busy(clientnum)) {
 		FILE* rf = fopen(mymod_tmpPath("mymod_voice_text.txt").c_str(), "r");
@@ -469,14 +588,7 @@ void mymod_pollPTT() {
 			while (fgets(vb, sizeof(vb), rf)) vtext += vb;
 			fclose(rf);
 			remove(mymod_tmpPath("mymod_voice_text.txt").c_str());
-			// trim + junk filter: need at least one letter (skips "", ". . .", hallucinated silence)
-			bool hasLetter = false;
-			for (char c : vtext) { if ((c>='a'&&c<='z')||(c>='A'&&c<='Z')) { hasLetter = true; break; } }
-			mymod_trimTail(vtext, "\n\r ");
-			if (hasLetter && vtext.size() >= 2) {
-				messagePlayer(clientnum, MESSAGE_MISC, "[MYMOD] you said: %s", vtext.c_str());
-				mymod_sendToFollower(vtext);
-			}
+			mymod_onTranscribed(vtext);
 		}
 	}
 	const bool down = keystatus[SDLK_v];

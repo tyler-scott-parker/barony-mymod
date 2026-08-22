@@ -181,6 +181,13 @@ endif()
 # * Not having FMOD installed will automatically disable FMOD (and, consequently, the game's sound engine as a whole).
 # * Running cmake with -DFMOD_ENABLED=OFF
 set(FMOD 0) #Acts as an alias to FMOD_FOUND
+# MYMOD/Adorcism: transcribe push-to-talk in-process with whisper.cpp, so a co-op client needs
+# no Python at all. OFF by default -- it adds real compile time and a model file, and the mod is
+# fully usable without it (the clip is handed to voice_bridge.py instead). Point WHISPER_ROOT at
+# a built whisper.cpp checkout, the same way STEAMWORKS_ROOT and NFD_DIR are supplied:
+#   cmake .. -DADORCISM_WHISPER=ON -DWHISPER_ROOT=~/whisper.cpp
+option(ADORCISM_WHISPER "Build in whisper.cpp for local speech-to-text" OFF)
+
 option(FMOD_ENABLED "Use the FMOD Ex library in the sound engine" ON)
 set(OPENAL 0) #Acts as an alias to OPENAL_FOUND
 option(OPENAL_ENABLED "Use the OpenAL library in the sound engine" OFF)
@@ -645,6 +652,32 @@ if (GAME_ENABLED)
 	#target_link_libraries(barony -lpng -lfmodex) Mingw, not Visual Studio.
   endif()
   target_link_libraries(barony ${EXTRA_LIBS}) #Apple needs this for OpenGL to work.
+
+# MYMOD/Adorcism: whisper.cpp, if it was asked for. Static libs are linked in dependency order
+# (whisper -> ggml -> ggml-cpu -> ggml-base); with a static archive the order is load-bearing.
+if(ADORCISM_WHISPER)
+  if(NOT WHISPER_ROOT)
+    set(WHISPER_ROOT "$ENV{WHISPER_ROOT}")
+  endif()
+  if(NOT WHISPER_ROOT OR NOT EXISTS "${WHISPER_ROOT}/include/whisper.h")
+    message(FATAL_ERROR
+      "ADORCISM_WHISPER=ON but WHISPER_ROOT does not point at a whisper.cpp checkout.\n"
+      "  git clone --depth 1 https://github.com/ggml-org/whisper.cpp\n"
+      "  cd whisper.cpp && cmake -B build -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=OFF \\\n"
+      "      -DWHISPER_BUILD_EXAMPLES=OFF -DWHISPER_BUILD_TESTS=OFF -DBUILD_SHARED_LIBS=OFF\n"
+      "  cmake --build build -j\n"
+      "then re-run cmake with -DWHISPER_ROOT=<that checkout>")
+  endif()
+  message(STATUS "Adorcism: whisper.cpp from ${WHISPER_ROOT}")
+  target_include_directories(barony PRIVATE
+    "${WHISPER_ROOT}/include" "${WHISPER_ROOT}/ggml/include")
+  target_link_libraries(barony
+    "${WHISPER_ROOT}/build/src/libwhisper.a"
+    "${WHISPER_ROOT}/build/ggml/src/libggml.a"
+    "${WHISPER_ROOT}/build/ggml/src/libggml-cpu.a"
+    "${WHISPER_ROOT}/build/ggml/src/libggml-base.a")
+  target_compile_definitions(barony PRIVATE MYMOD_WHISPER)
+endif()
 
   if (OPENAL)
 	target_link_libraries(barony ${OPENAL_LIBRARY})
