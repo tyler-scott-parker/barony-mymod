@@ -636,6 +636,98 @@ static int mymod_disarmFloorTraps() {
 	return n;
 }
 
+// ---- Spy sabotage: rigging the floor's traps ---------------------------------------------
+// A rigged trap fires TWICE -- a second boulder out of the same hole, a second volley from the
+// same shooter -- a couple of seconds after the first, once the player has stepped clear and
+// stopped worrying about it.
+//
+// No new firing code: the traps' own act functions do the work. skill[28] is Barony's power
+// state (0 = not powerable, 1 = unpowered, 2 = powered, mechanisms.cpp:876), and powering one
+// directly is what mechanisms.cpp:1293 already does. Clear the trap's fired flag, power it, and
+// it spawns exactly the boulder or volley it would have spawned normally.
+//
+// Milder than the minotaur on purpose: survivable, memorable, and it teaches the player to
+// distrust a floor rather than to reload.
+static const uint32_t MYMOD_RETRAP_DELAY = 2 * TICKS_PER_SECOND;
+
+struct MymodRiggedTrap {
+	int      lastFired  = -1;   // previous fired-state, to catch the moment it goes off
+	uint32_t refireAt   = 0;    // 0 = nothing scheduled
+	int      savedPower = -1;   // skill[28] before we forced it, so the circuit is left as found
+	bool     firing     = false;
+};
+static std::map<uint32_t, MymodRiggedTrap> mymod_rigged;
+static int mymod_riggedLevel = -1;
+
+// Boulders and arrows only. Magic and spear traps (actTrap/actTrapPermanent) already fire on a
+// repeating cycle, so "again" means nothing for them.
+static bool mymod_isRiggableTrap(Entity* e) {
+	if (!e) return false;
+	return e->behavior == &actArrowTrap
+		|| e->behavior == &actBoulderTrap  || e->behavior == &actBoulderTrapEast
+		|| e->behavior == &actBoulderTrapWest || e->behavior == &actBoulderTrapSouth;
+}
+
+// Both families keep their spent-state in skill[0]: the boulder as a 0/1 flag, the arrow trap
+// as a counter that is even when ready and odd when spent.
+static int mymod_trapFiredState(Entity* e) { return e->skill[0]; }
+
+static int mymod_rigFloorTraps() {
+	mymod_rigged.clear();
+	mymod_riggedLevel = currentlevel;
+	if (!map.entities) return 0;
+	for (node_t* nd = map.entities->first; nd != NULL; nd = nd->next) {
+		Entity* e = (Entity*)nd->element;
+		if (!mymod_isRiggableTrap(e)) continue;
+		if (e->actTrapSabotaged != 0) continue;   // a disarmed trap stays disarmed
+		MymodRiggedTrap r;
+		r.lastFired = mymod_trapFiredState(e);
+		mymod_rigged[e->getUID()] = r;
+	}
+	return (int)mymod_rigged.size();
+}
+
+// Host-side, every frame.
+static void mymod_riggedTrapTick() {
+	if (mymod_rigged.empty()) return;
+	if (currentlevel != mymod_riggedLevel || intro || !map.entities) {
+		mymod_rigged.clear();          // rigging is per floor; it does not follow you down
+		return;
+	}
+	for (auto it = mymod_rigged.begin(); it != mymod_rigged.end(); ) {
+		Entity* e = uidToEntity(it->first);
+		if (!e || !mymod_isRiggableTrap(e)) { it = mymod_rigged.erase(it); continue; }
+		MymodRiggedTrap& r = it->second;
+
+		if (r.firing) {
+			// It fired last frame off our forced power; put the circuit back as we found it.
+			if (r.savedPower >= 0) e->skill[28] = r.savedPower;
+			mymod_log("sabotage: rigged trap %u fired its second shot", (unsigned)it->first);
+			it = mymod_rigged.erase(it);       // one extra shot, never a loop
+			continue;
+		}
+		if (r.refireAt && ticks >= r.refireAt) {
+			r.savedPower = e->skill[28];
+			if (e->behavior == &actArrowTrap) {
+				if (e->skill[0] % 2 == 1) { e->skill[0]++; }   // odd = spent; make it ready
+				e->skill[3] = 0;                               // clear the refire cooldown
+			} else {
+				e->skill[0] = 0;                               // boulder: clear the fired flag
+			}
+			e->skill[28] = 2;                                  // power it, as a plate would
+			r.firing = true;
+			++it;
+			continue;
+		}
+		const int now = mymod_trapFiredState(e);
+		if (r.lastFired >= 0 && now > r.lastFired && !r.refireAt) {
+			r.refireAt = ticks + MYMOD_RETRAP_DELAY;           // it just went off
+		}
+		r.lastFired = now;
+		++it;
+	}
+}
+
 // ---- Haggled prices --------------------------------------------------------------------
 // A merchant who likes you shades the price your way. Deliberately tiny: Barony's own trading
 // skill already swings buy prices from x3.00 down to x1.00 (items.cpp:5990) and charisma moves
@@ -1764,7 +1856,17 @@ static void mymod_deliverSlot(int slot) {
 	}
 	// Applied on the main thread, before the line is spoken: the tell should land at the same
 	// moment the clock starts, not after it.
-	if (sabotage == "minotaur") { mymod_callMinotaur(slot < MAXPLAYERS ? slot : 0); cv.sabotage.clear(); }
+	if (!sabotage.empty()) {
+		const int who = (slot < MAXPLAYERS ? slot : 0);
+		if (sabotage == "minotaur") {
+			mymod_callMinotaur(who);
+		} else if (sabotage == "traps") {
+			const int n = mymod_rigFloorTraps();
+			mymod_log("sabotage: p%d's follower rigged %d trap(s) on floor %d to fire twice",
+				who, n, currentlevel);
+		}
+		cv.sabotage.clear();
+	}
 	// Main thread: the price map is read from Item::buyValue on this thread too.
 	if (!haggle.empty()) { mymod_applyHaggle(haggle); cv.haggle.clear(); }
 	cv.ready.store(false);
@@ -1983,6 +2085,8 @@ void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor)
 		mymod_minoWarnAt = 0;   // a pending warning must not follow the party to a new run
 		mymod_minoWarn2At = 0;
 		mymod_sabotageUsed = false;
+		mymod_rigged.clear();
+		mymod_riggedLevel = -1;
 		for (int c = 0; c < MAXPLAYERS; ++c) { mymod_partner[c] = 0; mymod_shopLine[c].clear(); }
 		mymod_watch.clear();
 		mymod_hurtCooldown.clear();
@@ -2059,6 +2163,7 @@ void mymod_pollAI() {
 		return;   // clients receive dialogue as vanilla MSGS/BUBL packets; nothing to poll
 	}
 	mymod_minotaurWarningTick();
+	mymod_riggedTrapTick();
 	mymod_syncFriendly();   // no-op unless /friendly changed or a client just joined
 	mymod_ambientTick();
 	for (int slot = 0; slot < MYMOD_MAX_SLOTS; ++slot) {
