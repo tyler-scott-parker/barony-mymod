@@ -968,9 +968,7 @@ static ConsoleCommand ccmd_aiforceattack("/aiforceattack", "MYMOD: directly orde
 			return;
 		}
 		mymod_ai_server = argv[1];
-		// persist so it survives restarts (simple config file)
-		FILE* cf = fopen("/tmp/mymod_server.cfg", "w");
-		if (cf) { fprintf(cf, "%s", mymod_ai_server.c_str()); fclose(cf); }
+		mymod_saveServerConfig();   // persists across restarts; the mod owns the path
 		messagePlayer(clientnum, MESSAGE_MISC, "[MYMOD] AI server set to: %s", mymod_ai_server.c_str());
 		});
 

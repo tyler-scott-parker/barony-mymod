@@ -235,6 +235,8 @@ static std::string mymod_jsonEscape(const std::string& in) {
 	return esc;
 }
 
+#include "mymod_net.hpp"   // transport + JSON reader, shared with httptest.cpp
+
 // =============================================================================
 //  NETCODE
 // =============================================================================
@@ -350,12 +352,12 @@ void mymod_pollPTT() {
 	extern std::unordered_map<SDL_Keycode, bool> keystatus;
 	// Voice result: if the bridge dropped transcribed text, feed it to the follower.
 	if (!mymod_busy(clientnum)) {
-		FILE* rf = fopen("/tmp/mymod_voice_text.txt", "r");
+		FILE* rf = fopen(mymod_tmpPath("mymod_voice_text.txt").c_str(), "r");
 		if (rf) {
 			std::string vtext; char vb[1024];
 			while (fgets(vb, sizeof(vb), rf)) vtext += vb;
 			fclose(rf);
-			remove("/tmp/mymod_voice_text.txt");
+			remove(mymod_tmpPath("mymod_voice_text.txt").c_str());
 			// trim + junk filter: need at least one letter (skips "", ". . .", hallucinated silence)
 			bool hasLetter = false;
 			for (char c : vtext) { if ((c>='a'&&c<='z')||(c>='A'&&c<='Z')) { hasLetter = true; break; } }
@@ -368,11 +370,11 @@ void mymod_pollPTT() {
 	}
 	bool down = keystatus[SDLK_v];
 	if (down && !mymod_ptt_down) {
-		FILE* f = fopen("/tmp/mymod_ptt.signal", "w");
+		FILE* f = fopen(mymod_tmpPath("mymod_ptt.signal").c_str(), "w");
 		if (f) { fputs("START", f); fclose(f); }
 		printlog("[MYMOD] listening... (release V to send)");
 	} else if (!down && mymod_ptt_down) {
-		FILE* f = fopen("/tmp/mymod_ptt.signal", "w");
+		FILE* f = fopen(mymod_tmpPath("mymod_ptt.signal").c_str(), "w");
 		if (f) { fputs("STOP", f); fclose(f); }
 		printlog("[MYMOD] (transcribing...)");
 	}
@@ -483,13 +485,9 @@ static void mymod_asyncAmbient(const std::string& payload) {
 	std::string server = mymod_ai_server;
 	std::thread([payload, server]() {
 		MymodConvo& c = mymod_convo[MYMOD_WORLD_SLOT];
-		char cmd[2048];
-		snprintf(cmd, sizeof(cmd),
-			"curl -s %s -X POST -d '%s' > /tmp/mymod_amb.json 2>/dev/null; "
-			"python3 -c 'import json;print(json.load(open(\"/tmp/mymod_amb.json\")).get(\"reply\",\"\"))'",
-			server.c_str(), payload.c_str());
-		FILE* p = popen(cmd, "r"); std::string out;
-		if (p) { char b[2048]; while (fgets(b, sizeof(b), p)) out += b; pclose(p); }
+		std::string body;
+		mymod_httpPost(server, payload, body);
+		std::string out = mymod_jsonField(body, "reply");
 		mymod_trimTail(out);
 		{ std::lock_guard<std::mutex> lk(c.mutex); c.reply = out; c.action = "NONE"; }
 		c.ready.store(true);
@@ -564,22 +562,12 @@ static void mymod_heckleFetch(const std::string& race) {
 		race.c_str(), currentlevel, MYMOD_HECKLE_BATCH, mymod_jsonEscape(pform).c_str());
 	std::string body = payload, server = mymod_ai_server;
 	std::thread([body, server]() {
-		char cmd[2048];
-		snprintf(cmd, sizeof(cmd),
-			"curl -s %s -X POST -d '%s' > /tmp/mymod_heckle.json 2>/dev/null; "
-			"python3 -c 'import json;print(chr(10).join("
-			"json.load(open(\"/tmp/mymod_heckle.json\")).get(\"lines\",[])))'",
-			server.c_str(), body.c_str());
-		FILE* f = popen(cmd, "r");
+		std::string resp;
+		mymod_httpPost(server, body, resp);
 		std::vector<std::string> got;
-		if (f) {
-			char b[512];
-			while (fgets(b, sizeof(b), f)) {
-				std::string s(b);
-				mymod_trimTail(s);
-				if (!s.empty()) got.push_back(s);
-			}
-			pclose(f);
+		for (auto& s : mymod_jsonStringArray(resp, "lines")) {
+			mymod_trimTail(s);
+			if (!s.empty()) got.push_back(s);
 		}
 		{ std::lock_guard<std::mutex> lk(mymod_heckleMutex); mymod_heckleIncoming = got; }
 		mymod_heckleReady.store(true);
@@ -977,42 +965,20 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 	std::string server = mymod_ai_server;
 	std::thread([payload, pnum, server]() {
 		MymodConvo& c = mymod_convo[pnum];
-		// Per-slot temp files: two players generating at once must never share a path.
-		char payloadPath[64], replyPath[64];
-		snprintf(payloadPath, sizeof(payloadPath), "/tmp/mymod_payload_%d.json", pnum);
-		snprintf(replyPath, sizeof(replyPath), "/tmp/mymod_ai_%d.json", pnum);
-		{
-			FILE* pf = fopen(payloadPath, "w");
-			if (pf) { fputs(payload.c_str(), pf); fclose(pf); }
-		}
-		char cmd[1536];
-		snprintf(cmd, sizeof(cmd),
-			"curl -s %s -X POST -H 'Content-Type: application/json' --data @%s > %s 2>/dev/null; "
-			"python3 -c 'import json;d=json.load(open(\"%s\"));print(d.get(\"reply\",\"\"));print(\"::ACTION::\"+d.get(\"action\",\"NONE\"));print(\"::NAME::\"+d.get(\"name\",\"\"));print(\"::SECRET::\"+d.get(\"secret\",\"\"));print(\"::BOON::\"+d.get(\"boon\",\"\"));print(\"::IDENT::\"+d.get(\"identify\",\"0\"));print(\"::HAGGLE::\"+d.get(\"haggle\",\"\"))'",
-			server.c_str(), payloadPath, replyPath, replyPath);
-		FILE* pipe = popen(cmd, "r");
-		std::string out;
-		if (pipe) { char buf[4096]; while (fgets(buf, sizeof(buf), pipe)) out += buf; pclose(pipe); }
-		std::string speech = out, action = "NONE";
-		size_t mark = out.find("::ACTION::");
-		if (mark != std::string::npos) { speech = out.substr(0, mark); action = out.substr(mark + 10); }
+		std::string body;
+		mymod_httpPost(server, payload, body);
+
+		std::string speech = mymod_jsonField(body, "reply");
+		std::string action = mymod_jsonField(body, "action");
+		std::string gname  = mymod_jsonField(body, "name");
+		std::string sec    = mymod_jsonField(body, "secret");
+		std::string boon   = mymod_jsonField(body, "boon");
+		std::string ident  = mymod_jsonField(body, "identify");
+		std::string hag    = mymod_jsonField(body, "haggle");
+		if (action.empty()) action = "NONE";
+		if (ident.empty())  ident = "0";
 		mymod_trimTail(speech);
-		mymod_trimTail(action);
 		if (speech.empty()) speech = "(no reply)";
-		// Split the tagged tail: reply\n::ACTION::X\n::NAME::Y\n::SECRET::Z\n::BOON::W
-		std::string gname, sec, boon;
-		size_t nmark = action.find("::NAME::");
-		if (nmark != std::string::npos) { gname = action.substr(nmark + 8); action = action.substr(0, nmark); }
-		size_t smark = gname.find("::SECRET::");
-		if (smark != std::string::npos) { sec = gname.substr(smark + 10); gname = gname.substr(0, smark); }
-		size_t bmark = sec.find("::BOON::");
-		if (bmark != std::string::npos) { boon = sec.substr(bmark + 8); sec = sec.substr(0, bmark); }
-		std::string ident, hag;
-		size_t imark = boon.find("::IDENT::");
-		if (imark != std::string::npos) { ident = boon.substr(imark + 9); boon = boon.substr(0, imark); }
-		size_t hmark = ident.find("::HAGGLE::");
-		if (hmark != std::string::npos) { hag = ident.substr(hmark + 10); ident = ident.substr(0, hmark); }
-		for (std::string* v : {&action, &gname, &sec, &boon, &ident, &hag}) mymod_trimTail(*v, "\n\r \t");
 		c.ident = ident;
 		if (!sec.empty()) {
 			size_t colon = sec.find(":");
@@ -1608,12 +1574,19 @@ static void mymod_deliverSlot(int slot) {
 //  SETUP + EVENTS
 // =============================================================================
 
+// Written from /aiserver. Lives beside the read in mymod_loadServerConfig so both ends agree
+// on the path, and so consolecommand.cpp needs no idea where it goes.
+void mymod_saveServerConfig() {
+	FILE* cf = fopen(mymod_tmpPath("mymod_server.cfg").c_str(), "w");
+	if (cf) { fprintf(cf, "%s", mymod_ai_server.c_str()); fclose(cf); }
+}
+
 // Load the saved AI server URL once at startup (persists /aiserver across restarts).
 void mymod_loadServerConfig() {
 	static bool loaded = false;
 	if (loaded) return;
 	loaded = true;
-	FILE* cf = fopen("/tmp/mymod_server.cfg", "r");
+	FILE* cf = fopen(mymod_tmpPath("mymod_server.cfg").c_str(), "r");
 	if (cf) {
 		char buf[512];
 		if (fgets(buf, sizeof(buf), cf)) {
@@ -1642,17 +1615,12 @@ void mymod_log(const char* fmt, ...) {
 	int fl = currentlevel;
 	std::string mp = mymod_jsonEscape(map.name);
 	std::thread([msg, server, fl, mp]() {
-		FILE* pf = fopen("/tmp/mymod_log.json", "w");
-		if (pf) {
-			fprintf(pf, "{\"log\":\"%s\",\"src\":\"cpp\",\"floor\":%d,\"map\":\"%s\"}",
-				msg.c_str(), fl, mp.c_str());
-			fclose(pf);
-		}
-		char cmd[512];
-		snprintf(cmd, sizeof(cmd),
-			"curl -s %s -X POST -H 'Content-Type: application/json' --data @/tmp/mymod_log.json >/dev/null 2>&1",
-			server.c_str());
-		int rc = system(cmd); (void)rc;
+		char body[1024];
+		snprintf(body, sizeof(body),
+			"{\"log\":\"%s\",\"src\":\"cpp\",\"floor\":%d,\"map\":\"%s\"}",
+			msg.c_str(), fl, mp.c_str());
+		std::string resp;
+		mymod_httpPost(server, body, resp);
 	}).detach();
 }
 
@@ -1697,20 +1665,14 @@ void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor)
 	int fl = floor;
 	std::string server = mymod_ai_server;
 	std::thread([t, r, u, fl, owner, origin, originKey, server]() {
-		FILE* pf = fopen("/tmp/mymod_event.json", "w");
-		if (pf) {
-			fprintf(pf, "{\"event\":\"%s\",\"race\":\"%s\",\"floor\":%d,\"uid\":%u,\"player\":%d,"
-				"\"origin\":\"%s\",\"origin_key\":\"%s\"}",
-				t.c_str(), r.c_str(), fl, (unsigned)u, owner,
-				origin.c_str(), mymod_jsonEscape(originKey).c_str());
-			fclose(pf);
-		}
-		char cmd[512];
-		snprintf(cmd, sizeof(cmd),
-			"curl -s %s -X POST -H 'Content-Type: application/json' --data @/tmp/mymod_event.json >/dev/null 2>&1",
-			server.c_str());
-		int rc = system(cmd);
-		(void)rc;
+		char body[512];
+		snprintf(body, sizeof(body),
+			"{\"event\":\"%s\",\"race\":\"%s\",\"floor\":%d,\"uid\":%u,\"player\":%d,"
+			"\"origin\":\"%s\",\"origin_key\":\"%s\"}",
+			t.c_str(), r.c_str(), fl, (unsigned)u, owner,
+			origin.c_str(), mymod_jsonEscape(originKey).c_str());
+		std::string resp;
+		mymod_httpPost(server, body, resp);
 	}).detach();
 }
 

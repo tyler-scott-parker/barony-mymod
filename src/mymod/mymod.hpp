@@ -51,5 +51,6 @@ void mymod_debugStatus(int player);    // /aistatus -- what the mod currently be
 void mymod_identifyRequest(int player, int nth);  // /aiidentify -- spec 9, host-only for now
 
 // --- session logging: engine-only facts pushed into the service's timeline ---
+void mymod_saveServerConfig();   // /aiserver -> disk, so the mod owns the (portable) path
 void mymod_log(const char* fmt, ...);
 void mymod_playerNote(int player, const std::string& text);   // /ailog <note>
