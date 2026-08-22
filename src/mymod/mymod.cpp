@@ -176,12 +176,16 @@ struct MymodFollowerWatch {
 	uint32_t seenTick = 0;
 	uint32_t farSince = 0;   // when they first fell too far behind (0 = they are with you)
 	uint32_t lastWound = 0, lastHeal = 0, lastFar = 0;
+	uint32_t lastPanic = 0;     // fearful followers break under fire; this is the cooldown
 };
 static std::map<uint32_t, MymodFollowerWatch> mymod_watch;
 static int mymod_watchLevel = -1;   // watch map is per-floor; a level change is not a massacre
 
 static std::map<uint32_t, uint32_t> mymod_hurtCooldown;   // follower uid -> last hurt_by_player tick
 
+static const double   MYMOD_PANIC_FRACTION = 0.50;        // a fearful follower breaks here
+static const int      MYMOD_PANIC_DURATION = 8 * TICKS_PER_SECOND;
+static const uint32_t MYMOD_PANIC_COOLDOWN = 30 * TICKS_PER_SECOND;   // then they can rally
 static const double   MYMOD_WOUND_FRACTION = 0.35;        // "nearly killed" threshold
 static const double   MYMOD_HEAL_FRACTION  = 0.15;        // HP jump that reads as a deliberate heal
 static const double   MYMOD_HEAL_RANGE_SQ  = (6.0*16) * (6.0*16);
@@ -201,6 +205,19 @@ static inline bool mymod_isHost() { return multiplayer != CLIENT; }
 // externed from files.cpp and actmonster.cpp and would drag two upstream files along with it.
 static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum, int floor,
                                    uint32_t about);
+
+// ---- Traits the engine has to act on --------------------------------------------------
+// Allegiance itself stays in the service -- the engine has no business knowing who the spy is,
+// and its log is visible. Only traits the engine must ENFORCE come across, and there is one:
+// a fearful follower breaks under fire, which has to trigger on HP that only the engine sees.
+static std::map<uint32_t, std::string> mymod_traits;
+static std::mutex mymod_traitsMutex;
+
+static bool mymod_hasTrait(uint32_t uid, const char* trait) {
+	std::lock_guard<std::mutex> lk(mymod_traitsMutex);
+	auto it = mymod_traits.find(uid);
+	return it != mymod_traits.end() && it->second == trait;
+}
 
 // Which player leads this monster? Prefers monsterAllyIndex (replicated as skill[42]),
 // falls back to leader_uid — forceFollower() clears monsterAllyIndex before our hook runs,
@@ -1301,6 +1318,29 @@ void mymod_ambientTick() {
 					}
 				}
 			}
+			// ⚠ A fearful follower BREAKS rather than dying for you. EFF_COWARDICE is the
+			// game's own effect: shouldRetreat() honours it (entity.cpp:25937) so they run,
+			// and it docks STR and CON so they fight worse while panicking. The engine refuses
+			// it for liches, devils, shadows and minotaurs (entity.cpp:24128), which is fine --
+			// none of those are frightened of anything.
+			//
+			// Triggered on CROSSING the threshold, not on sitting below it, so it reads as a
+			// moment of breaking rather than a permanent state. The cooldown lets them rally.
+			if (fes->MAXHP > 0 && w.lastHP >= 0 && !leveledUp
+				&& mymod_hasTrait(fuid, "fearful")) {
+				const double wasFrac = (double)w.lastHP / (prevMax > 0 ? prevMax : fes->MAXHP);
+				const double nowFrac = (double)fes->HP / fes->MAXHP;
+				const bool fighting = (fe->monsterState == MONSTER_STATE_ATTACK
+					|| fe->monsterState == MONSTER_STATE_HUNT);
+				if (fighting && wasFrac >= MYMOD_PANIC_FRACTION && nowFrac < MYMOD_PANIC_FRACTION
+					&& ticks - w.lastPanic >= MYMOD_PANIC_COOLDOWN) {
+					w.lastPanic = ticks;
+					if (fe->setEffect(EFF_COWARDICE, (Uint8)2, MYMOD_PANIC_DURATION, true)) {
+						mymod_log("panic: p%d's fearful follower %u broke and ran at %d/%d HP",
+							owner, (unsigned)fuid, fes->HP, fes->MAXHP);
+					}
+				}
+			}
 			w.lastHP = fes->HP;
 			w.maxHP = fes->MAXHP;
 
@@ -2301,6 +2341,7 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		for (int c = 0; c < MAXPLAYERS; ++c) { mymod_partner[c] = 0; mymod_shopLine[c].clear(); }
 		mymod_watch.clear();
 		mymod_hurtCooldown.clear();
+		{ std::lock_guard<std::mutex> lk(mymod_traitsMutex); mymod_traits.clear(); }
 		mymod_watchLevel = -1;
 	}
 	std::string t = etype ? etype : "";
@@ -2331,6 +2372,11 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 			origin.c_str(), mymod_jsonEscape(originKey).c_str(), (unsigned)ab);
 		std::string resp;
 		mymod_httpPost(server, body, resp);
+		const std::string tr = mymod_jsonField(resp, "traits");
+		if (u && !tr.empty()) {
+			std::lock_guard<std::mutex> lk(mymod_traitsMutex);
+			mymod_traits[u] = tr;
+		}
 	}).detach();
 }
 
