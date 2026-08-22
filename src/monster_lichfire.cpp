@@ -93,6 +93,50 @@ void initLichFire(Entity* my, Stat* myStats)
 			int defaultItems = countDefaultItems(myStats);
 
 			my->setHardcoreStats(*myStats);
+			// MYMOD: what a follower told you about the Archmagisters. `who` selects the twin
+			// (1 = Erudyce / LICH_ICE, 2 = Orpheus / LICH_FIRE), so a truth about one sibling
+			// does nothing to the other -- which is the point of learning WHICH one.
+			//
+			// ⚠ A NEGATIVE debuff is a BUFF: a spy's lie at the endgame makes the fight harder
+			// rather than merely wasting the one thing a follower could have told you. Tier 2
+			// doubles either direction if the informant is still alive when they spawn.
+			{
+				extern int mymod_twins_debuff;
+				extern uint32_t mymod_twins_informant;
+				extern int mymod_twins_who;
+				extern void mymod_log(const char* fmt, ...);
+				if ( mymod_twins_debuff != 0 && mymod_twins_who == 2 )
+				{
+					int mult = 1;
+					if ( mymod_twins_informant != 0 )
+					{
+						Entity* inf = uidToEntity(mymod_twins_informant);
+						if ( inf && inf->getStats() && inf->getStats()->HP > 0 ) { mult = 2; }
+					}
+					const int d = mymod_twins_debuff;
+					switch ( d > 0 ? d : -d )
+					{
+						case 1: // loses the thread
+							myStats->INT = std::max(0, myStats->INT - (d > 0 ? 5 : -5) * mult);
+							break;
+						case 2: // wears himself out
+							myStats->MAXMP = std::max(100, myStats->MAXMP - (d > 0 ? 300 : -300) * mult);
+							myStats->MP = myStats->MAXMP;
+							break;
+						case 3: // concentration broken
+							myStats->CON = std::max(0, myStats->CON - (d > 0 ? 6 : -6) * mult);
+							break;
+						case 4: // half-committed
+							myStats->MAXHP = std::max(200, myStats->MAXHP - (d > 0 ? 400 : -400) * mult);
+							myStats->HP = myStats->MAXHP; myStats->OLDHP = myStats->HP;
+							break;
+						default: break;
+					}
+					mymod_log("TWINS: Orpheus %s %d (tier %d) HP=%d MP=%d INT=%d CON=%d",
+						d > 0 ? "debuff" : "BUFF", d > 0 ? d : -d, mult,
+						myStats->MAXHP, myStats->MAXMP, myStats->INT, myStats->CON);
+				}
+			}
 
 			// generate the default inventory items for the monster, provided the editor sprite allowed enough default slots
 			switch ( defaultItems )

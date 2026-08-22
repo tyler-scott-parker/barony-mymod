@@ -79,6 +79,12 @@ bool mymod_busy(int player) {
 
 // Run-global Herx state: one boss, one secret per playthrough, whichever player learns it.
 int mymod_herx_debuff = 0;
+// The Archmagisters. who: 1 = Erudyce (LICH_ICE), 2 = Orpheus (LICH_FIRE).
+// ⚠ A NEGATIVE debuff is a BUFF -- a spy's lie at the endgame makes the fight harder rather
+// than merely wasting the one thing a follower could have told you.
+int mymod_twins_debuff = 0;
+uint32_t mymod_twins_informant = 0;
+int mymod_twins_who = 0;
 uint32_t mymod_herx_informant = 0;
 
 std::string mymod_ai_server = "http://localhost:5001";  // host-side only (BYO-model)
@@ -1705,10 +1711,21 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 		if (speech.empty()) speech = "(no reply)";
 		c.ident = ident;
 		if (!sec.empty()) {
+			// "<debuff>:<uid>" for Herx, or "<debuff>:<uid>:twins:<who>" for the Archmagisters.
+			// who: 1 = Erudyce (LICH_ICE), 2 = Orpheus (LICH_FIRE). A NEGATIVE debuff is a buff.
 			size_t colon = sec.find(":");
 			if (colon != std::string::npos) {
-				mymod_herx_debuff = atoi(sec.substr(0, colon).c_str());
-				mymod_herx_informant = (uint32_t)strtoul(sec.substr(colon+1).c_str(), nullptr, 10);
+				const int d = atoi(sec.substr(0, colon).c_str());
+				const uint32_t inf =
+					(uint32_t)strtoul(sec.substr(colon + 1).c_str(), nullptr, 10);
+				if (sec.find(":twins:") != std::string::npos) {
+					mymod_twins_debuff = d;
+					mymod_twins_informant = inf;
+					mymod_twins_who = atoi(sec.substr(sec.rfind(':') + 1).c_str());
+				} else {
+					mymod_herx_debuff = d;
+					mymod_herx_informant = inf;
+				}
 			}
 		}
 		{
