@@ -1896,16 +1896,25 @@ void mymod_identifyRequest(int pnum, int nth) {
 		items[it->type].getIdentifiedName(), unid, mymod_identDecoys(it), false);
 }
 
+static Entity* mymod_findFollower(int pnum);   // defined below
+
 // HOST: talk to a non-follower NPC. `greeting` is the line they volunteer when engaged.
 static void mymod_requestNPC(int pnum, Entity* npc, const std::string& says, bool greeting) {
 	std::string role, npcName;
 	int shop = -1;
 	mymod_npcDescribe(npc, role, shop, npcName);
 	std::string raceName = getMonsterLocalizedName(npc->getRace());
+	// Who is standing behind you. Just the uid -- the service already knows what that
+	// follower is, and allegiance has no business crossing to the engine. A mercenary at your
+	// shoulder talks the merchant down; that decision is made service-side from this.
+	uint32_t escort = 0;
+	if (Entity* f = mymod_findFollower(pnum)) escort = f->getUID();
 	char tail[512];
 	snprintf(tail, sizeof(tail),
-		",\"npc\":true,\"greeting\":%s,\"npc_name\":\"%s\",\"npc_role\":\"%s\",\"shop\":%d",
-		greeting ? "true" : "false", mymod_jsonEscape(npcName).c_str(), role.c_str(), shop);
+		",\"npc\":true,\"greeting\":%s,\"npc_name\":\"%s\",\"npc_role\":\"%s\",\"shop\":%d,"
+		"\"escort\":%u",
+		greeting ? "true" : "false", mymod_jsonEscape(npcName).c_str(), role.c_str(), shop,
+		(unsigned)escort);
 	std::string payload = "{" + mymod_payloadHead(pnum, raceName, npc->getUID(), says) + tail + "}";
 	mymod_fireRequest(pnum, payload, npc->getUID(), true,
 		npcName.empty() ? raceName.c_str() : npcName.c_str());
