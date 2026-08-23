@@ -1901,6 +1901,17 @@ static const char* MYMOD_CATEGORY_NAMES[] = {
 };
 static Uint32 mymod_identItem[MAXPLAYERS] = { 0 };   // item awaiting a verdict, per player
 
+// What the GAME weighs an item at when deciding whether it can be appraised. Mirrors
+// Player::Inventory_t::Appraisal_t::appraisalPossible (interface/identify_and_appraise.cpp:372)
+// exactly, GEM_GLASS special case included -- a worthless gem that looks valuable is supposed
+// to be hard to tell from a real one, and skipping that would let a follower spot the joke for
+// free. Passing this to the service is what lets a follower's competence be expressed in the
+// game's own currency instead of an invented blocklist.
+static int mymod_appraisalValue(Item* it) {
+	if (!it) return 0;
+	return (it->type == GEM_GLASS) ? 1000 : it->getGoldValue();
+}
+
 // The nth (1-based) unidentified item in this player's inventory.
 static Item* mymod_findUnidentified(int pnum, int nth) {
 	if (!stats[pnum]) return nullptr;
@@ -1941,17 +1952,18 @@ static bool mymod_identRemote[MAXPLAYERS] = { false };
 // because for a remote client the item lives in THAT client's inventory, not ours.
 static void mymod_identifyFire(int pnum, Entity* follower, Uint32 itemUid, const char* catName,
                                const char* real, const char* unid, const std::string& decoysJson,
-                               bool remote) {
+                               bool remote, int value) {
 	mymod_identItem[pnum] = itemUid;
 	mymod_identRemote[pnum] = remote;
 	std::string raceName = getMonsterLocalizedName(follower->getRace());
 	char tail[768];
 	snprintf(tail, sizeof(tail),
-		",\"party\":%d,\"identify\":{\"category\":\"%s\",\"real\":\"%s\",\"unid\":\"%s\",\"decoys\":%s}",
+		",\"party\":%d,\"identify\":{\"category\":\"%s\",\"real\":\"%s\",\"unid\":\"%s\","
+		"\"decoys\":%s,\"value\":%d}",
 		mymod_partySize(), catName,
 		mymod_jsonEscape(real ? real : "").c_str(),
 		mymod_jsonEscape(unid ? unid : "").c_str(),
-		decoysJson.c_str());
+		decoysJson.c_str(), value);
 	std::string payload = "{" + mymod_payloadHead(pnum, raceName, follower->getUID(),
 		"what is this? can you tell me what I'm carrying?") + tail + "}";
 	mymod_fireRequest(pnum, payload, follower->getUID(), false, raceName.c_str());
@@ -1997,6 +2009,10 @@ static void mymod_netSendIdentify(Item* it, int nth) {
 	};
 	put(catName); put(real); put(unid);
 	for (auto& d : decoys) put(d.c_str());
+	// ⚠ AFTER the decoys, which are read by the count in data[9], so appending here cannot be
+	// confused with one of them. Kept out of the fixed header so the existing offsets and the
+	// packtest assertions around them stay as they were.
+	{ char vb[16]; snprintf(vb, sizeof(vb), "%d", mymod_appraisalValue(it)); put(vb); }
 	net_packet->address.host = net_server.host;
 	net_packet->address.port = net_server.port;
 	net_packet->len = (int)off;
@@ -2030,6 +2046,7 @@ void mymod_netServerRecvIdentify() {
 		decoysJson += "\"" + mymod_jsonEscape(d) + "\"";
 	}
 	decoysJson += "]";
+	const int value = atoi(get().c_str());   // trailing field; 0 from an older client
 	Entity* follower = mymod_findFollower(pnum);
 	if (!follower) {
 		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] nobody of yours nearby to ask");
@@ -2037,7 +2054,7 @@ void mymod_netServerRecvIdentify() {
 	}
 	mymod_log("identify: client p%d asked about item %u (%s)", pnum, (unsigned)itemUid, unid.c_str());
 	mymod_identifyFire(pnum, follower, itemUid, catName.c_str(), real.c_str(), unid.c_str(),
-		decoysJson, true);
+		decoysJson, true, value);
 }
 
 // HOST -> client ('MYIV'): the verdict. Only a correct AND honest claim identifies the item.
@@ -2097,7 +2114,8 @@ void mymod_identifyRequest(int pnum, int nth) {
 	const Category cat = items[it->type].category;
 	const char* catName = (cat >= 0 && cat < CATEGORY_MAX) ? MYMOD_CATEGORY_NAMES[cat] : "thing";
 	mymod_identifyFire(pnum, follower, it->uid, catName,
-		items[it->type].getIdentifiedName(), unid, mymod_identDecoys(it), false);
+		items[it->type].getIdentifiedName(), unid, mymod_identDecoys(it), false,
+		mymod_appraisalValue(it));
 }
 
 static Entity* mymod_findFollower(int pnum);   // defined below

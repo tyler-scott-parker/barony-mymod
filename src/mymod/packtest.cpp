@@ -11,7 +11,7 @@ static void W32(Uint32 v, Uint8* p){ p[0]=v>>24;p[1]=v>>16;p[2]=v>>8;p[3]=v; }
 static Uint32 R32(Uint8* p){ return (p[0]<<24)|(p[1]<<16)|(p[2]<<8)|p[3]; }
 
 static void pack(int clientnum, Uint32 uid, const char* cat, const char* real,
-                 const char* unid, std::vector<std::string> decoys) {
+                 const char* unid, std::vector<std::string> decoys, int value) {
     memset(DATA,0,sizeof(DATA));
     strcpy((char*)DATA, "MYID");
     DATA[4]=(Uint8)clientnum;
@@ -28,10 +28,12 @@ static void pack(int clientnum, Uint32 uid, const char* cat, const char* real,
     };
     put(cat); put(real); put(unid);
     for(auto&d:decoys) put(d.c_str());
+    // The appraisal value rides AFTER the counted decoys, so it cannot be mistaken for one.
+    { char vb[16]; snprintf(vb,sizeof(vb),"%d",value); put(vb); }
     LEN=(int)off;
 }
 static void unpack(int& pnum, Uint32& uid, std::string& cat, std::string& real,
-                   std::string& unid, std::vector<std::string>& decoys) {
+                   std::string& unid, std::vector<std::string>& decoys, int& value) {
     pnum = DATA[4] < 4 ? DATA[4] : 3;
     uid = R32(&DATA[5]);
     int nd = DATA[9]; if(nd<0||nd>3) nd=0;
@@ -45,23 +47,28 @@ static void unpack(int& pnum, Uint32& uid, std::string& cat, std::string& real,
     cat=get(); real=get(); unid=get();
     decoys.clear();
     for(int k=0;k<nd;++k){ std::string d=get(); if(!d.empty()) decoys.push_back(d); }
+    value = atoi(get().c_str());   // 0 from an older client that does not send it
 }
 static int fails=0;
 static void check(const char* label,int cn,Uint32 uid,const char* cat,const char* real,
-                  const char* unid,std::vector<std::string> dec){
-    pack(cn,uid,cat,real,unid,dec);
-    int p; Uint32 u; std::string c,r,n; std::vector<std::string> d;
-    unpack(p,u,c,r,n,d);
-    bool ok = (p==cn && u==uid && c==cat && r==real && n==unid && d.size()==dec.size());
+                  const char* unid,std::vector<std::string> dec,int val=0){
+    pack(cn,uid,cat,real,unid,dec,val);
+    int p; Uint32 u; std::string c,r,n; std::vector<std::string> d; int v=-1;
+    unpack(p,u,c,r,n,d,v);
+    bool ok = (p==cn && u==uid && c==cat && r==real && n==unid && d.size()==dec.size() && v==val);
     for(size_t i=0;ok&&i<d.size();++i) ok = (d[i]==dec[i]);
-    printf("  [%s] %-34s len=%d  uid=%u cat=%s real=%s decoys=%zu\n",
-           ok?"PASS":"FAIL", label, LEN, u, c.c_str(), r.c_str(), d.size());
+    printf("  [%s] %-34s len=%d  uid=%u cat=%s real=%s decoys=%zu value=%d\n",
+           ok?"PASS":"FAIL", label, LEN, u, c.c_str(), r.c_str(), d.size(), v);
     if(!ok){ fails++; printf("        got pnum=%d cat=%s real=%s unid=%s\n",p,c.c_str(),r.c_str(),n.c_str()); }
 }
 int main(){
     check("typical ring",1,4242,"ring","ring of levitation","gold ring",
-          {"ring of strength","ring of teleportation","ring of warning"});
-    check("no decoys",2,7,"food","bread","bread",{});
+          {"ring of strength","ring of teleportation","ring of warning"}, 2000);
+    check("no decoys",2,7,"food","bread","bread",{},9);
+    // ⚠ The legendary tier: a 5000-gold value must survive the wire intact, because the
+    // service refuses the appraisal on exactly this number.
+    check("artifact-tier value",1,88,"weapon","artifact sword","curved sword",
+          {"steel sword","crystal sword","silver sword"}, 5000);
     check("one decoy",3,999999,"gem","garnet","red gemstone",{"glass"});
     check("empty unid name",1,5,"tool","lantern","",{"torch"});
     check("longest realistic names",1,123456,"spellbook",
@@ -71,11 +78,12 @@ int main(){
     // every field after it must still parse. Barony item names are far shorter than this.
     {
         std::string huge(200,'x');
-        pack(1,1,"ring",huge.c_str(),"gold ring",{"ring of warning"});
-        int p; Uint32 u; std::string c,r,n; std::vector<std::string> d;
-        unpack(p,u,c,r,n,d);
+        pack(1,1,"ring",huge.c_str(),"gold ring",{"ring of warning"},2500);
+        int p; Uint32 u; std::string c,r,n; std::vector<std::string> d; int v=0;
+        unpack(p,u,c,r,n,d,v);
         bool ok = (r.size()==63 && r==std::string(63,'x') && c=="ring" && n=="gold ring"
-                   && d.size()==1 && d[0]=="ring of warning" && LEN<NET_PACKET_SIZE);
+                   && d.size()==1 && d[0]=="ring of warning" && v==2500
+                   && LEN<NET_PACKET_SIZE);
         printf("  [%s] %-34s truncated to %zu chars, later fields intact (unid=%s decoy=%s)\n",
                ok?"PASS":"FAIL","over-long field",r.size(),n.c_str(),
                d.empty()?"-":d[0].c_str());
