@@ -1595,6 +1595,44 @@ static const char* mymod_swimHazard(int pnum, int medium) {
 	return "";
 }
 
+// ---- the adventurer dying ---------------------------------------------------------------------
+// ⚠ Death is not the same event in singleplayer and co-op, and the game says so itself:
+//
+//   lang 577  "You die..."
+//   lang 578  "You will be revived if your party survives to the next level."
+//   lang 5264 "When a player dies, they retain their inventory when revived on the next level."
+//   lang 6875 "Your spirit rejoins your body."
+//
+// So in a party the right line is "keep going, get to the stairs and we get them back", and
+// alone it is simply the end. Whether ghosts are possible at all is the game's own call --
+// Player::Ghost_t::gamemodeAllowsGhosts() -- which is true for multiplayer AND splitscreen,
+// and false in the tutorial. Guessing from `multiplayer` alone would get splitscreen wrong.
+//
+// ⚠ There must also be somebody left to reach those stairs: with the whole party down, nobody
+// is coming back, so survivors are counted before promising anything.
+static Entity* mymod_deathSpeaker(int dead, int& outOwner) {
+	outOwner = -1;
+	if (!map.entities) return nullptr;
+	Entity* own = nullptr; int ownOwner = -1;
+	Entity* other = nullptr; int otherOwner = -1;
+	for (node_t* nd = map.entities->first; nd != NULL; nd = nd->next) {
+		Entity* e = (Entity*)nd->element;
+		if (!e || e->behavior != &actMonster) continue;
+		Stat* es = e->getStats();
+		if (!es || es->HP <= 0) continue;
+		const int o = mymod_ownerOf(e);
+		if (o < 0) continue;
+		// ⚠ The dead player's OWN follower is found by monsterAllyIndex, which is a plain
+		// replicated int and survives its leader's entity being destroyed -- the leader_uid
+		// fallback in mymod_ownerOf cannot resolve once the body is gone.
+		if (o == dead) { if (!own) { own = e; ownOwner = o; } }
+		else if (!other) { other = e; otherOwner = o; }
+	}
+	if (own) { outOwner = ownOwner; return own; }
+	outOwner = otherOwner;
+	return other;
+}
+
 // ---- the party killing something -------------------------------------------------------------
 // ⚠ kills[] is the game's own per-run tally, credited to a player (entity.cpp:18411 for the host,
 // net.cpp:5225 for a client) and cleared on a new game. So an edge on it means "your side just
@@ -1744,6 +1782,27 @@ static void mymod_remarkTick() {
 			mymod_trapArrowNear[pnum] = 0;      // one line per volley, not per arrow
 			if (Entity* f = mymod_remarkSpeaker(pnum, true, true)) {
 				mymod_requestRemark(pnum, f, "arrowtrap", "");
+			}
+		}
+		// --- the adventurer died ---
+		if (mymod_hpSeeded[pnum] && hp <= 0 && mymod_lastHP[pnum] > 0) {
+			int survivors = 0;
+			for (int c = 0; c < MAXPLAYERS; ++c) {
+				if (c == pnum || client_disconnected[c] || !stats[c]) continue;
+				if (stats[c]->HP > 0) ++survivors;
+			}
+			const bool canReturn = Player::Ghost_t::gamemodeAllowsGhosts() && survivors > 0;
+			int speakerOwner = -1;
+			Entity* f = mymod_deathSpeaker(pnum, speakerOwner);
+			// Routed through the SPEAKER's slot, not the corpse's: the follower doing the
+			// talking may belong to somebody still standing.
+			if (f && speakerOwner >= 0 && !mymod_convo[speakerOwner].inflight.load()) {
+				mymod_lastValuableTick = ticks;
+				char extra[128];
+				snprintf(extra, sizeof(extra), ",\"own\":%s,\"canreturn\":%s",
+					(speakerOwner == pnum) ? "true" : "false",
+					canReturn ? "true" : "false");
+				mymod_requestRemark(speakerOwner, f, "death", extra);
 			}
 		}
 		mymod_lastHP[pnum] = hp;
