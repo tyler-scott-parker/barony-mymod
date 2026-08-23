@@ -1662,7 +1662,11 @@ static Item* mymod_equipAt(Stat* st, int i) {
 // ⚠ Sent as the game's own SKILL NAME and TIER, never a raw number. Barony's tiers are
 // NOVICE 1 / BASIC 20 / SKILLED 40 / EXPERT 60 / MASTER 80 / LEGENDARY 100 (stat.hpp:195), and
 // getSkillLangEntry gives the localized name, so none of it is invented here.
-static const int MYMOD_SKILL_CHANCE = 20;      // percent, once per floor
+// ⚠ Praise and teasing are SEPARATE remarks, rolled independently. One line trying to do both
+// ("you are an expert with the axe but hopeless at stealth") reads as a performance review;
+// split, each is a thing a companion would actually say on its own.
+static const int MYMOD_SKILL_BEST_CHANCE  = 15;   // percent, once per floor
+static const int MYMOD_SKILL_WORST_CHANCE = 15;   // percent, once per floor
 static int mymod_skillLevel = -1;              // floor this was last offered on
 
 static const char* mymod_skillTier(int v) {
@@ -1876,26 +1880,37 @@ static void mymod_remarkTick() {
 		// --- what they are best and worst at, once per floor ---
 		if (mymod_skillLevel != currentlevel) {
 			mymod_skillLevel = currentlevel;
-			if (local_rng.rand() % 100 < MYMOD_SKILL_CHANCE) {
-				int hi = -1, lo = -1;
+			const bool wantBest  = (local_rng.rand() % 100 < MYMOD_SKILL_BEST_CHANCE);
+			const bool wantWorst = (local_rng.rand() % 100 < MYMOD_SKILL_WORST_CHANCE);
+			if (wantBest || wantWorst) {
+				// ⚠ Ties broken at random, not by index. Most of a fresh character's skills sit
+				// at the same value, and always picking the lowest index would mean the same
+				// joke about lockpicking every single run.
+				int hi = -1, lo = -1, hiTies = 0, loTies = 0;
 				for (int k = 0; k < NUMPROFICIENCIES; ++k) {
 					const int v = stats[pnum]->getProficiency(k);
-					if (hi < 0 || v > stats[pnum]->getProficiency(hi)) hi = k;
-					if (lo < 0 || v < stats[pnum]->getProficiency(lo)) lo = k;
+					if (hi < 0 || v > stats[pnum]->getProficiency(hi)) { hi = k; hiTies = 1; }
+					else if (v == stats[pnum]->getProficiency(hi)
+						&& local_rng.rand() % (++hiTies) == 0) { hi = k; }
+					if (lo < 0 || v < stats[pnum]->getProficiency(lo)) { lo = k; loTies = 1; }
+					else if (v == stats[pnum]->getProficiency(lo)
+						&& local_rng.rand() % (++loTies) == 0) { lo = k; }
 				}
-				// ⚠ Needs a real strength to name. A fresh character is all zeroes, and
-				// "you are hopeless at everything" is not the line.
-				if (hi >= 0 && lo >= 0 && stats[pnum]->getProficiency(hi) >= SKILL_LEVEL_BASIC) {
+				// ⚠ Needs a real strength somewhere before either fires. A fresh character is
+				// all zeroes: there is nothing to praise, and teasing someone for being bad at
+				// everything on floor one is just unpleasant.
+				const bool ready = (hi >= 0 && lo >= 0
+					&& stats[pnum]->getProficiency(hi) >= SKILL_LEVEL_BASIC);
+				// Never both in one turn -- that is the performance review again.
+				const bool doBest = wantBest && (!wantWorst || (local_rng.rand() % 2 == 0));
+				if (ready) {
+					const int k = doBest ? hi : lo;
 					if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
-						char extra[320];
-						snprintf(extra, sizeof(extra),
-							",\"best\":\"%s\",\"besttier\":\"%s\","
-							"\"worst\":\"%s\",\"worsttier\":\"%s\"",
-							mymod_jsonEscape(getSkillLangEntry(hi)).c_str(),
-							mymod_skillTier(stats[pnum]->getProficiency(hi)),
-							mymod_jsonEscape(getSkillLangEntry(lo)).c_str(),
-							mymod_skillTier(stats[pnum]->getProficiency(lo)));
-						mymod_requestRemark(pnum, f, "skills", extra);
+						char extra[224];
+						snprintf(extra, sizeof(extra), ",\"skill\":\"%s\",\"tier\":\"%s\"",
+							mymod_jsonEscape(getSkillLangEntry(k)).c_str(),
+							mymod_skillTier(stats[pnum]->getProficiency(k)));
+						mymod_requestRemark(pnum, f, doBest ? "skillbest" : "skillworst", extra);
 					}
 				}
 			}
