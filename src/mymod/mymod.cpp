@@ -1697,6 +1697,43 @@ static Uint32 mymod_boulderNear[MAXPLAYERS] = { 0 };
 static std::set<uint32_t> mymod_boulderPushed;   // shoved boulders already remarked on, per floor
 static int mymod_boulderLevel = -1;
 
+// ---- a wall coming down --------------------------------------------------------------------
+// ⚠ Counted, not hooked. Walls are destroyed in entity.cpp:16709 (map.tiles[OBSTACLELAYER..] = 0)
+// by a pickaxe, and also by magic, bombs and other things -- so counting how many obstacle tiles
+// remain catches EVERY route into "we made our own way through", which is the point, and adds
+// nothing to the upstream diff. One pass over the layer per second is a few thousand comparisons.
+static int mymod_wallCount = -1;
+static int mymod_wallLevel = -1;
+
+static int mymod_countWalls() {
+	if (!map.tiles) return 0;
+	int n = 0;
+	for (int x = 0; x < (int)map.width; ++x) {
+		for (int y = 0; y < (int)map.height; ++y) {
+			if (map.tiles[OBSTACLELAYER + y * MAPLAYERS + x * MAPLAYERS * map.height]) ++n;
+		}
+	}
+	return n;
+}
+
+// ---- fountains -------------------------------------------------------------------------------
+// ⚠ The fountain documents itself (actfountain.cpp:88): skill[0] is 1 until used and 0 after,
+// and skill[1] is what it does -- 0 spawn succubus, 1 raise hunger, 2 random potion effect,
+// 3 bless equipment. So watching skill[0] fall to 0 catches the drink, and skill[1] says what
+// the follower just watched happen. No hook, and no guessing at the outcome.
+static const char* MYMOD_FOUNTAIN_KINDS[] = { "succubus", "hunger", "potion", "bless" };
+static std::map<uint32_t, int> mymod_fountainSeen;    // uid -> skill[0] last seen
+
+// ---- the biome you are standing in -------------------------------------------------------------
+static const int MYMOD_BIOME_CHANCE = 18;      // percent, once per floor
+static int mymod_biomeLevel = -1;
+
+// ---- the bridges between biomes ----------------------------------------------------------------
+// ⚠ Matched on the map's INTERNAL name, which for all four transition levels contains
+// "Transit" -- "Mines to Swamp Transition", "Swamp to Labyrinth Transit...". Read out of the
+// .lmp headers, not guessed.
+static std::string mymod_lastBridge;
+
 // ---- rich and poor -----------------------------------------------------------------------------
 // ⚠ Bands, edge-triggered, like hunger. Calibrated against the economy the appraisal work
 // measured: starting gold is 0-250 for most classes, a floor pile is ~60+floor, and a shop sword
@@ -1994,6 +2031,16 @@ static void mymod_remarkTick() {
 			mymod_levSeeded[pnum] = true;
 		}
 
+		// --- the biome, occasionally ---
+		if (mymod_biomeLevel != currentlevel) {
+			mymod_biomeLevel = currentlevel;
+			if (local_rng.rand() % 100 < MYMOD_BIOME_CHANCE) {
+				if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+					mymod_requestRemark(pnum, f, "biome", "");
+				}
+			}
+		}
+
 		// --- rich or destitute ---
 		{
 			const int g = (int)stats[pnum]->GOLD;
@@ -2084,6 +2131,26 @@ static void mymod_remarkTick() {
 
 	if (!map.entities) return;
 
+	// --- a bridge between biomes ---
+	// ⚠ The hunger flag is READ, not assumed. MFLAG_DISABLEHUNGER genuinely gates hunger
+	// (entity.cpp:4656 builds processHunger from it), so if a transition level sets it the
+	// follower can say so -- and if it does not, the claim is simply never made.
+	if (mymod_lastBridge != map.name) {
+		mymod_lastBridge = map.name;
+		if (strstr(map.name, "Transit") != nullptr) {
+			for (int c = 0; c < MAXPLAYERS; ++c) {
+				if (!players[c] || !players[c]->entity) continue;
+				if (Entity* f = mymod_remarkSpeaker(c, false)) {
+					char extra[96];
+					snprintf(extra, sizeof(extra), ",\"nohunger\":%s",
+						MFLAG_DISABLEHUNGER ? "true" : "false");
+					mymod_requestRemark(c, f, "bridge", extra);
+					break;
+				}
+			}
+		}
+	}
+
 	// --- a special or optional area, on arrival ---
 	// Fires on the map NAME changing, not the floor number: secret levels and the DLC share
 	// floor numbers with ordinary ones, and only the name tells them apart.
@@ -2112,6 +2179,7 @@ static void mymod_remarkTick() {
 	if (currentlevel != mymod_boulderLevel) {
 		mymod_boulderLevel = currentlevel;
 		mymod_boulderPushed.clear();
+		mymod_fountainSeen.clear();
 	}
 	if (currentlevel != mymod_bossLevel) {
 		mymod_bossLevel = currentlevel;
@@ -2142,10 +2210,54 @@ static void mymod_remarkTick() {
 	// --- trap arrows in flight, and whether the floor still has anything hostile on it ---
 	const bool scanClear = (ticks >= mymod_nextClearScan);
 	if (scanClear) mymod_nextClearScan = ticks + 50;    // once a second is plenty
+
+	// --- a wall taken down ---
+	if (scanClear) {
+		const int walls = mymod_countWalls();
+		if (currentlevel != mymod_wallLevel) {
+			mymod_wallLevel = currentlevel;
+			mymod_wallCount = walls;          // a new floor is not a demolition
+		} else if (mymod_wallCount >= 0 && walls < mymod_wallCount) {
+			for (int c = 0; c < MAXPLAYERS; ++c) {
+				if (!players[c] || !players[c]->entity) continue;
+				if (Entity* f = mymod_remarkSpeaker(c, false)) {
+					mymod_requestRemark(c, f, "dig", "");
+					break;
+				}
+			}
+		}
+		mymod_wallCount = walls;
+	}
 	int hostiles = 0;
 	for (node_t* nd = map.entities->first; nd != NULL; nd = nd->next) {
 		Entity* e = (Entity*)nd->element;
 		if (!e) continue;
+		if (e->behavior == &actFountain) {
+			const uint32_t fu = e->getUID();
+			auto prev = mymod_fountainSeen.find(fu);
+			const int now = e->skill[0];
+			if (prev != mymod_fountainSeen.end() && prev->second > 0 && now == 0) {
+				const int k = e->skill[1];
+				const char* kind = (k >= 0 && k < 4) ? MYMOD_FOUNTAIN_KINDS[k] : "potion";
+				int best = -1; double bestD = 1e18;
+				for (int c = 0; c < MAXPLAYERS; ++c) {
+					if (!players[c] || !players[c]->entity) continue;
+					const double dx = e->x - players[c]->entity->x;
+					const double dy = e->y - players[c]->entity->y;
+					const double d = dx * dx + dy * dy;
+					if (d < bestD) { bestD = d; best = c; }
+				}
+				if (best >= 0 && bestD < (double)(8 * 16) * (8 * 16)) {
+					if (Entity* f = mymod_remarkSpeaker(best, false)) {
+						char extra[96];
+						snprintf(extra, sizeof(extra), ",\"effect\":\"%s\"", kind);
+						mymod_requestRemark(best, f, "fountain", extra);
+					}
+				}
+			}
+			mymod_fountainSeen[fu] = now;
+			continue;
+		}
 		if (e->behavior == &actBoulder) {
 			if (e->skill[4] == 0) continue;                  // BOULDER_ROLLING
 			for (int c = 0; c < MAXPLAYERS; ++c) {
@@ -3590,6 +3702,11 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		mymod_followerKit.clear();
 		mymod_boulderPushed.clear();
 		mymod_boulderLevel = -1;
+		mymod_wallCount = -1;
+		mymod_wallLevel = -1;
+		mymod_fountainSeen.clear();
+		mymod_biomeLevel = -1;
+		mymod_lastBridge.clear();
 		mymod_areaSeeded = false;
 		for (int t = 0; t < NUMMONSTERS; ++t) mymod_lastKills[t] = 0;
 		mymod_killsSeeded = false;
