@@ -1503,6 +1503,58 @@ static bool mymod_chestWasOpen[MAXPLAYERS] = { false };
 // the effect rather than re-triggering it, which is what a player actually does with booze.
 static bool mymod_wasDrunk[MAXPLAYERS] = { false };
 
+// ---- hunger, and the automaton's boiler ---------------------------------------------------
+// ⚠ AN AUTOMATON DOES NOT GET HUNGRY. getEntityHungerInterval (entity.cpp) returns -1 -- the
+// game's own word for "unreachable" -- for HUNGRY, WEAK and STARVING when the player is an
+// AUTOMATON, and 5000 for OVERSATIATED. What it has instead is a boiler: SUPERHEATED at 1200
+// and CRITICAL at 300. So it is a pressure gauge, not a stomach, and a follower saying "you
+// look hungry" to one would be talking nonsense.
+//
+// Insectoids are a third case (100/50/25 instead of 250/150/50) and vampires are sustained by
+// blood rather than food. All of it comes out of the game's own function, so none of it is
+// duplicated here -- we only ask which band the player is in.
+enum MymodHungerState {
+	MYMOD_HUNGER_NORMAL = 0,
+	MYMOD_HUNGER_OVERSATIATED,
+	MYMOD_HUNGER_HUNGRY,
+	MYMOD_HUNGER_WEAK,
+	MYMOD_HUNGER_STARVING,
+	MYMOD_HUNGER_SUPERHEATED,
+	MYMOD_HUNGER_CRITICAL,
+};
+static const char* MYMOD_HUNGER_NAMES[] = {
+	"normal", "oversatiated", "hungry", "weak", "starving", "superheated", "critical",
+};
+static int mymod_hungerState[MAXPLAYERS] = { 0 };
+
+static int mymod_hungerStateOf(int pnum) {
+	Stat* st = stats[pnum];
+	if (!st) return MYMOD_HUNGER_NORMAL;
+	// Hunger can be switched off for the whole run, at which point the value simply stops
+	// moving and none of this means anything.
+	if (!(svFlags & SV_FLAG_HUNGER)) return MYMOD_HUNGER_NORMAL;
+	Entity* pe = (players[pnum] ? players[pnum]->entity : nullptr);
+	const int h = st->HUNGER;
+	if (st->type == AUTOMATON) {
+		if (h >= getEntityHungerInterval(pnum, pe, st, HUNGER_INTERVAL_AUTOMATON_SUPERHEATED))
+			return MYMOD_HUNGER_SUPERHEATED;
+		if (h <= getEntityHungerInterval(pnum, pe, st, HUNGER_INTERVAL_AUTOMATON_CRITICAL))
+			return MYMOD_HUNGER_CRITICAL;
+		return MYMOD_HUNGER_NORMAL;
+	}
+	// Most severe first: starving < weak < hungry, so testing in the other order would report
+	// a starving player as merely hungry.
+	if (h <= getEntityHungerInterval(pnum, pe, st, HUNGER_INTERVAL_STARVING))
+		return MYMOD_HUNGER_STARVING;
+	if (h <= getEntityHungerInterval(pnum, pe, st, HUNGER_INTERVAL_WEAK))
+		return MYMOD_HUNGER_WEAK;
+	if (h <= getEntityHungerInterval(pnum, pe, st, HUNGER_INTERVAL_HUNGRY))
+		return MYMOD_HUNGER_HUNGRY;
+	if (h > getEntityHungerInterval(pnum, pe, st, HUNGER_INTERVAL_OVERSATIATED))
+		return MYMOD_HUNGER_OVERSATIATED;
+	return MYMOD_HUNGER_NORMAL;
+}
+
 // ---- a chest that was a monster --------------------------------------------------------------
 // ⚠ A mimic is NOT a chest that transforms -- map generation REPLACES a chest with a MIMIC
 // monster entity at the chest's position (maps.cpp:10893), so it never touches openedChest and
@@ -1553,6 +1605,30 @@ static void mymod_remarkTick() {
 			}
 		}
 		mymod_chestWasOpen[pnum] = chestOpen;
+
+		// --- hunger, or an automaton's boiler ---
+		// ⚠ Edge-triggered on the BAND, not the number: HUNGER ticks down constantly, and a
+		// remark per point would be unbearable. Only entering a state worth mentioning speaks;
+		// dropping back to normal is silent, because "you are no longer starving" is not a line.
+		const int hs = mymod_hungerStateOf(pnum);
+		if (hs != mymod_hungerState[pnum]) {
+			const int was = mymod_hungerState[pnum];
+			mymod_hungerState[pnum] = hs;
+			// ⚠ Only on getting WORSE. Eating your way from starving up to hungry should not
+			// trigger a fresh complaint about being hungry on the way past.
+			const bool worse = (hs != MYMOD_HUNGER_NORMAL)
+				&& (was == MYMOD_HUNGER_NORMAL || hs > was
+					|| hs == MYMOD_HUNGER_SUPERHEATED || hs == MYMOD_HUNGER_OVERSATIATED);
+			if (worse) {
+				if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+					char extra[96];
+					snprintf(extra, sizeof(extra), ",\"state\":\"%s\"%s",
+						MYMOD_HUNGER_NAMES[hs],
+						playerRequiresBloodToSustain(pnum) ? ",\"blood\":true" : "");
+					mymod_requestRemark(pnum, f, "hunger", extra);
+				}
+			}
+		}
 
 		// --- drunk ---
 		const bool drunk = stats[pnum]->getEffectActive(EFF_DRUNK);
@@ -2786,6 +2862,7 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 			mymod_seenSeeded[c] = false;
 			mymod_chestWasOpen[c] = false;
 			mymod_wasDrunk[c] = false;
+			mymod_hungerState[c] = MYMOD_HUNGER_NORMAL;
 		}
 		mymod_lastValuableTick = 0;
 		mymod_seenMimics.clear();
