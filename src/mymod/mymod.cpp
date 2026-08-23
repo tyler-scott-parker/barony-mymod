@@ -1502,6 +1502,7 @@ static const Uint32 MYMOD_VALUABLE_COOLDOWN = 20 * 50;   // gems come in bunches
 // mimic goes unremarked -- so REACTIVE ignores everything, and the two lower tiers keep only a
 // small shared gap so two lines never land back to back.
 enum MymodRemarkTier { MYMOD_TIER_REACTIVE = 0, MYMOD_TIER_EVENT = 1, MYMOD_TIER_IDLE = 2 };
+static int mymod_lastTierUsed = -1;   // set by mymod_remarkSpeaker, read by requestRemark
 static const Uint32 MYMOD_TIER_GAP[3] = { 50 * 2, 50 * 15, 50 * 60 };
 static const Uint32 MYMOD_REMARK_SPACING = 50 * 5;   // between any two non-reactive lines
 static Uint32 mymod_tierLast[3] = { 0, 0, 0 };
@@ -1530,6 +1531,7 @@ static Entity* mymod_remarkSpeaker(int pnum, int tier, bool inFight = false) {
 	if (!reactive && !inFight && mymod_inCombat[f->getUID()]) return nullptr;
 	mymod_tierLast[tier] = ticks;
 	mymod_anyRemarkAt = ticks;
+	mymod_lastTierUsed = tier;      // for the log; read by the requestRemark that follows
 	return f;
 }
 
@@ -3155,15 +3157,26 @@ static std::string mymod_payloadHead(int pnum, const std::string& raceName, uint
 	if (stats[pnum] && stats[pnum]->type != HUMAN && stats[pnum]->type != NOTHING) {
 		playerRace = getMonsterLocalizedName(stats[pnum]->type);
 	}
+	// ⚠ THE SPEAKER'S ENGINE NAME, for the log rather than the prompt. follower_state is keyed
+	// by uid, and a level change RE-CREATES every follower as a new entity with a new uid
+	// (game.cpp:2438 -> summonMonster, entity_shared.cpp:490), so the service's row is orphaned
+	// at every staircase. Stat->name survives the transition (copyStats), so logging it is what
+	// lets logreview see the same creature reappear under a second uid and say so.
+	std::string engineName;
+	if (Entity* spk = uidToEntity(uid)) {
+		if (Stat* ss = spk->getStats()) {
+			if (ss->name[0]) engineName = ss->name;
+		}
+	}
 	snprintf(buf, sizeof(buf),
 		"\"race\":\"%s\",\"floor\":%d,\"map\":\"%s\",\"says\":\"%s\",\"uid\":%u,"
 		"\"player\":%d,\"player_name\":\"%s\",\"origin\":\"%s\",\"origin_key\":\"%s\","
-		"\"gold\":%d,\"player_kind\":\"%s\"",
+		"\"gold\":%d,\"player_kind\":\"%s\",\"follower_name\":\"%s\"",
 		raceName.c_str(), currentlevel, mymod_jsonEscape(map.name).c_str(),
 		mymod_jsonEscape(says).c_str(), (unsigned)uid,
 		pnum, mymod_jsonEscape(playerName).c_str(),
 		origin, mymod_jsonEscape(originKey).c_str(), purse,
-		mymod_jsonEscape(playerRace).c_str());
+		mymod_jsonEscape(playerRace).c_str(), mymod_jsonEscape(engineName).c_str());
 	return std::string(buf);
 }
 
@@ -3279,8 +3292,9 @@ static void mymod_requestValuable(int pnum, Entity* f, Item* it, int value) {
 static void mymod_requestRemark(int pnum, Entity* f, const char* kind, const char* extra) {
 	if (!f || !kind) return;
 	std::string raceName = getMonsterLocalizedName(f->getRace(), f->getStats());
-	char tail[256];
-	snprintf(tail, sizeof(tail), ",\"remark\":\"%s\"%s", kind, extra ? extra : "");
+	char tail[288];
+	snprintf(tail, sizeof(tail), ",\"remark\":\"%s\",\"tier\":%d%s",
+		kind, mymod_lastTierUsed, extra ? extra : "");
 	std::string payload = "{" + mymod_payloadHead(pnum, raceName, f->getUID(), "") + tail + "}";
 	mymod_fireRequest(pnum, payload, f->getUID(), false, raceName.c_str());
 	mymod_log("remark: %s -> p%d's %s", kind, pnum, raceName.c_str());
