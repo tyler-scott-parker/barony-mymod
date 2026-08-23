@@ -1466,7 +1466,7 @@ static void mymod_requestRemark(int pnum, Entity* f, const char* kind, const cha
 
 static std::set<Uint32> mymod_seenItems[MAXPLAYERS];
 static bool  mymod_seenSeeded[MAXPLAYERS] = { false };
-static Uint32 mymod_lastValuableTick = 0;
+static Uint32 mymod_lastValuableTick = 0;   // retained: the valuable-pickup seed guard
 
 // ⚠ Seeded silently on the first pass, or a Merchant's 1000 starting gold worth of kit would
 // all read as "just picked up" the instant the run began.
@@ -1476,20 +1476,52 @@ static const Uint32 MYMOD_VALUABLE_COOLDOWN = 20 * 50;   // gems come in bunches
 // A follower eligible to say something right now: alive, this player's, and not already
 // mid-generation. `urgent` skips the shared cooldown and the combat guard -- a chest that turns
 // out to be a monster is worth interrupting for; an observation about the scenery is not.
-// `urgent` skips the shared cooldown; `inFight` allows speaking mid-combat. Most remarks want
-// neither -- admiring a gemstone while something is biting you reads as broken rather than as
-// character -- but a kill happens IN a fight, and a mimic or an arrow is worth interrupting for.
-static Entity* mymod_remarkSpeaker(int pnum, bool urgent, bool inFight = false) {
+// ---- How often any of this is allowed to speak -------------------------------------------------
+// ⚠ THREE TIERS, because one shared cooldown was the wrong shape. With thirty kinds of remark,
+// a single gate either lets flavour crowd out the things that matter or makes a boulder to the
+// face wait twenty seconds for its turn. The tier says how URGENT a reaction is, which is a
+// different question from how important the event was:
+//
+//   REACTIVE  something just happened TO them, visibly, and a late line is nonsense. A boulder,
+//             an arrow, a mimic, lava, dying, standing there with no clothes on. Essentially
+//             ungated -- 2s only, to stop one event producing two lines -- and it ignores the
+//             global spacing and the combat guard entirely.
+//   EVENT     worth saying, not urgent: a boss down, a new area, a gift, kit, the purse.
+//   IDLE      pure flavour that could have been said at any point: the biome, food, a chest,
+//             what they are good at. Rare on purpose (spec 35/36: scarcity).
+//
+// ⚠ Tiers do NOT block one another. An idle line about the swamp must never be the reason a
+// mimic goes unremarked -- so REACTIVE ignores everything, and the two lower tiers keep only a
+// small shared gap so two lines never land back to back.
+enum MymodRemarkTier { MYMOD_TIER_REACTIVE = 0, MYMOD_TIER_EVENT = 1, MYMOD_TIER_IDLE = 2 };
+static const Uint32 MYMOD_TIER_GAP[3] = { 50 * 2, 50 * 15, 50 * 60 };
+static const Uint32 MYMOD_REMARK_SPACING = 50 * 5;   // between any two non-reactive lines
+static Uint32 mymod_tierLast[3] = { 0, 0, 0 };
+static Uint32 mymod_anyRemarkAt = 0;
+
+static Entity* mymod_remarkSpeaker(int pnum, int tier, bool inFight = false) {
 	if (pnum < 0 || pnum >= MAXPLAYERS) return nullptr;
 	if (!stats[pnum] || !players[pnum] || !players[pnum]->entity) return nullptr;
-	if (!urgent && ticks - mymod_lastValuableTick < MYMOD_VALUABLE_COOLDOWN) return nullptr;
+	if (tier < 0 || tier > 2) tier = MYMOD_TIER_IDLE;
+	const bool reactive = (tier == MYMOD_TIER_REACTIVE);
+	if (mymod_tierLast[tier] != 0 && ticks - mymod_tierLast[tier] < MYMOD_TIER_GAP[tier]) {
+		return nullptr;
+	}
+	if (!reactive && mymod_anyRemarkAt != 0
+		&& ticks - mymod_anyRemarkAt < MYMOD_REMARK_SPACING) {
+		return nullptr;
+	}
+	// The conversation slot is what actually serialises generation; the gaps above are pacing.
 	if (mymod_convo[pnum].inflight.load() || mymod_anyPlayerBusy()) return nullptr;
 	Entity* f = mymod_findFollower(pnum);
 	if (!f) return nullptr;
 	Stat* fs = f->getStats();
 	if (!fs || fs->HP <= 0) return nullptr;
-	if (!urgent && !inFight && mymod_inCombat[f->getUID()]) return nullptr;
-	mymod_lastValuableTick = ticks;
+	// ⚠ Admiring a gemstone while something is biting you reads as broken rather than as
+	// character -- but a kill happens IN a fight, and a mimic is worth interrupting for.
+	if (!reactive && !inFight && mymod_inCombat[f->getUID()]) return nullptr;
+	mymod_tierLast[tier] = ticks;
+	mymod_anyRemarkAt = ticks;
 	return f;
 }
 
@@ -1878,13 +1910,13 @@ static void mymod_valuablesTick() {
 		mymod_seenSeeded[pnum] = true;
 		// The valuable find wins the turn if there is one; food is the consolation.
 		if (found && bestValue >= MYMOD_VALUABLE_MIN) {
-			if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+			if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_IDLE)) {
 				mymod_requestValuable(pnum, f, found, bestValue);
 			}
 			continue;
 		}
 		if (foundFood) {
-			if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+			if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_IDLE)) {
 				char extra[160];
 				snprintf(extra, sizeof(extra), ",\"look\":\"%s\"",
 					mymod_jsonEscape(items[foundFood->type].getIdentifiedName()).c_str());
@@ -1904,7 +1936,7 @@ static void mymod_remarkTick() {
 		const bool chestOpen = (openedChest[pnum] != nullptr);
 		if (chestOpen && !mymod_chestWasOpen[pnum]
 			&& local_rng.rand() % 100 < MYMOD_CHEST_CHANCE) {
-			if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+			if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_IDLE)) {
 				mymod_requestRemark(pnum, f, "chest", "");
 			}
 		}
@@ -1924,7 +1956,7 @@ static void mymod_remarkTick() {
 				&& (was == MYMOD_HUNGER_NORMAL || hs > was
 					|| hs == MYMOD_HUNGER_SUPERHEATED || hs == MYMOD_HUNGER_OVERSATIATED);
 			if (worse) {
-				if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+				if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_EVENT)) {
 					char extra[96];
 					snprintf(extra, sizeof(extra), ",\"state\":\"%s\"%s",
 						MYMOD_HUNGER_NAMES[hs],
@@ -1952,9 +1984,40 @@ static void mymod_remarkTick() {
 			// of thing a companion notices only a third of the time.
 			Item* newIt = (changed >= 0) ? mymod_equipAt(stats[pnum], changed) : nullptr;
 			const bool legendary = newIt && mymod_appraisalValue(newIt) > MYMOD_LEGENDARY_VALUE;
-			if (mymod_equipSeeded[pnum] && changed >= 0
+			// ⚠ THE AMULET OF STRANGULATION IS ITS OWN EVENT, and it is not the same event for
+			// everyone. It forces itself cursed on equip (items.cpp:2963), then chokes you --
+			// EXCEPT a skeleton, which the damage loop skips outright (entity.cpp:7724), and a
+			// SUCCUBUS or INCUBUS, who take the damage but feed on it: "You feel energized?"
+			// (lang 3358, entity.cpp:7735). Three different things to watch happen.
+			if (newIt && newIt->type == AMULET_STRANGULATION) {
+				if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_REACTIVE)) {
+					const Monster t = stats[pnum]->type;
+					const char* who = (t == SKELETON) ? "skeleton"
+						: ((t == SUCCUBUS || t == INCUBUS) ? "demon" : "other");
+					char extra[96];
+					snprintf(extra, sizeof(extra), ",\"victim\":\"%s\"", who);
+					mymod_requestRemark(pnum, f, "strangle", extra);
+				}
+			}
+			// ⚠ Beatitude only when the item is IDENTIFIED. An unidentified curse is something
+			// the game deliberately hides until it bites, and a follower announcing it would be
+			// free identification -- the same leak the appraisal ceiling exists to close.
+			else if (newIt && newIt->identified && newIt->beatitude != 0) {
+				if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_EVENT)) {
+					char extra[256];
+					snprintf(extra, sizeof(extra),
+						",\"look\":\"%s\",\"slot\":\"%s\",\"blessing\":\"%s\"",
+						mymod_jsonEscape(items[newIt->type].getIdentifiedName()).c_str(),
+						MYMOD_EQUIP_SLOTS[changed].slot,
+						newIt->beatitude > 0 ? "blessed" : "cursed");
+					mymod_requestRemark(pnum, f, "blessed", extra);
+				}
+			}
+			const bool special = newIt && (newIt->type == AMULET_STRANGULATION
+				|| (newIt->identified && newIt->beatitude != 0));
+			if (mymod_equipSeeded[pnum] && changed >= 0 && !special
 				&& (legendary || local_rng.rand() % 100 < MYMOD_EQUIP_CHANCE)) {
-				if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+				if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_EVENT)) {
 					char extra[256];
 					snprintf(extra, sizeof(extra),
 						",\"look\":\"%s\",\"slot\":\"%s\",\"legendary\":%s",
@@ -1994,7 +2057,7 @@ static void mymod_remarkTick() {
 				const bool doBest = wantBest && (!wantWorst || (local_rng.rand() % 2 == 0));
 				if (ready) {
 					const int k = doBest ? hi : lo;
-					if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+					if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_IDLE)) {
 						char extra[224];
 						snprintf(extra, sizeof(extra), ",\"skill\":\"%s\",\"tier\":\"%s\"",
 							mymod_jsonEscape(getSkillLangEntry(k)).c_str(),
@@ -2011,7 +2074,7 @@ static void mymod_remarkTick() {
 			// ⚠ NOT suppressed at seed time, unlike the other watches: a character who starts
 			// the run with no clothes on is exactly the case worth a line.
 			if (naked && (!mymod_nakedSeeded[pnum] || !mymod_wasNaked[pnum])) {
-				if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+				if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_REACTIVE)) {
 					mymod_requestRemark(pnum, f, "naked", "");
 				}
 			}
@@ -2023,7 +2086,7 @@ static void mymod_remarkTick() {
 		{
 			const bool lev = isLevitating(stats[pnum]);
 			if (lev && mymod_levSeeded[pnum] && !mymod_wasLevitating[pnum]) {
-				if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+				if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_EVENT)) {
 					mymod_requestRemark(pnum, f, "levitate", "");
 				}
 			}
@@ -2035,7 +2098,7 @@ static void mymod_remarkTick() {
 		if (mymod_biomeLevel != currentlevel) {
 			mymod_biomeLevel = currentlevel;
 			if (local_rng.rand() % 100 < MYMOD_BIOME_CHANCE) {
-				if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+				if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_IDLE)) {
 					mymod_requestRemark(pnum, f, "biome", "");
 				}
 			}
@@ -2046,7 +2109,7 @@ static void mymod_remarkTick() {
 			const int g = (int)stats[pnum]->GOLD;
 			const int band = (g <= MYMOD_GOLD_POOR) ? -1 : (g >= MYMOD_GOLD_RICH ? 1 : 0);
 			if (mymod_goldSeeded[pnum] && band != mymod_goldBand[pnum] && band != 0) {
-				if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+				if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_EVENT)) {
 					char extra[64];
 					snprintf(extra, sizeof(extra), ",\"band\":\"%s\"",
 						band < 0 ? "poor" : "rich");
@@ -2065,7 +2128,10 @@ static void mymod_remarkTick() {
 			// ⚠ Lava is urgent and may be shouted mid-fight: it is doing damage every tick and
 			// a line twenty seconds later would be an obituary.
 			const bool lava = (medium == 2);
-			if (Entity* f = mymod_remarkSpeaker(pnum, lava, lava)) {
+			// ⚠ Lava is REACTIVE and plain water is not: one is burning them every tick, the
+			// other is a paddle. Same event, two different urgencies.
+			if (Entity* f = mymod_remarkSpeaker(pnum,
+					lava ? MYMOD_TIER_REACTIVE : MYMOD_TIER_EVENT, lava)) {
 				char extra[128];
 				snprintf(extra, sizeof(extra), ",\"medium\":\"%s\",\"hazard\":\"%s\"",
 					lava ? "lava" : "water", mymod_swimHazard(pnum, medium));
@@ -2084,7 +2150,7 @@ static void mymod_remarkTick() {
 			&& mymod_trapArrowNear[pnum] != 0
 			&& ticks - mymod_trapArrowNear[pnum] <= 6) {
 			mymod_trapArrowNear[pnum] = 0;      // one line per volley, not per arrow
-			if (Entity* f = mymod_remarkSpeaker(pnum, true, true)) {
+			if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_REACTIVE)) {
 				mymod_requestRemark(pnum, f, "arrowtrap", "");
 			}
 		}
@@ -2101,7 +2167,11 @@ static void mymod_remarkTick() {
 			// Routed through the SPEAKER's slot, not the corpse's: the follower doing the
 			// talking may belong to somebody still standing.
 			if (f && speakerOwner >= 0 && !mymod_convo[speakerOwner].inflight.load()) {
-				mymod_lastValuableTick = ticks;
+				// ⚠ Bypasses the tier gate on purpose -- a death always speaks -- but it still
+				// stamps the clocks, or an idle line about the scenery lands on the corpse a
+				// second later.
+				mymod_tierLast[MYMOD_TIER_REACTIVE] = ticks;
+				mymod_anyRemarkAt = ticks;
 				char extra[128];
 				snprintf(extra, sizeof(extra), ",\"own\":%s,\"canreturn\":%s",
 					(speakerOwner == pnum) ? "true" : "false",
@@ -2112,7 +2182,7 @@ static void mymod_remarkTick() {
 		if (mymod_hpSeeded[pnum] && hp < mymod_lastHP[pnum] && hp > 0
 			&& mymod_boulderNear[pnum] != 0 && ticks - mymod_boulderNear[pnum] <= 8) {
 			mymod_boulderNear[pnum] = 0;      // one line per boulder, not per tick of damage
-			if (Entity* f = mymod_remarkSpeaker(pnum, true, true)) {
+			if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_REACTIVE)) {
 				mymod_requestRemark(pnum, f, "boulderhit", "");
 			}
 		}
@@ -2122,7 +2192,7 @@ static void mymod_remarkTick() {
 		// --- drunk ---
 		const bool drunk = stats[pnum]->getEffectActive(EFF_DRUNK);
 		if (drunk && !mymod_wasDrunk[pnum]) {
-			if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+			if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_EVENT)) {
 				mymod_requestRemark(pnum, f, "drunk", "");
 			}
 		}
@@ -2140,7 +2210,7 @@ static void mymod_remarkTick() {
 		if (strstr(map.name, "Transit") != nullptr) {
 			for (int c = 0; c < MAXPLAYERS; ++c) {
 				if (!players[c] || !players[c]->entity) continue;
-				if (Entity* f = mymod_remarkSpeaker(c, false)) {
+				if (Entity* f = mymod_remarkSpeaker(c, MYMOD_TIER_EVENT)) {
 					char extra[96];
 					snprintf(extra, sizeof(extra), ",\"nohunger\":%s",
 						MFLAG_DISABLEHUNGER ? "true" : "false");
@@ -2161,7 +2231,7 @@ static void mymod_remarkTick() {
 			if (mymod_areaSeeded) {
 				for (int c = 0; c < MAXPLAYERS; ++c) {
 					if (!players[c] || !players[c]->entity) continue;
-					if (Entity* f = mymod_remarkSpeaker(c, false)) {
+					if (Entity* f = mymod_remarkSpeaker(c, MYMOD_TIER_EVENT)) {
 						char extra[192];
 						snprintf(extra, sizeof(extra), ",\"look\":\"%s\"",
 							mymod_jsonEscape(area).c_str());
@@ -2198,7 +2268,7 @@ static void mymod_remarkTick() {
 		if (timerNow && !mymod_minoTimerSeen && mymod_minoGuardUsed) {
 			for (int c = 0; c < MAXPLAYERS; ++c) {
 				if (!players[c] || !players[c]->entity) continue;
-				if (Entity* f = mymod_remarkSpeaker(c, false, true)) {
+				if (Entity* f = mymod_remarkSpeaker(c, MYMOD_TIER_EVENT, true)) {
 					mymod_requestRemark(c, f, "minotimer", "");
 					break;
 				}
@@ -2220,7 +2290,7 @@ static void mymod_remarkTick() {
 		} else if (mymod_wallCount >= 0 && walls < mymod_wallCount) {
 			for (int c = 0; c < MAXPLAYERS; ++c) {
 				if (!players[c] || !players[c]->entity) continue;
-				if (Entity* f = mymod_remarkSpeaker(c, false)) {
+				if (Entity* f = mymod_remarkSpeaker(c, MYMOD_TIER_EVENT)) {
 					mymod_requestRemark(c, f, "dig", "");
 					break;
 				}
@@ -2248,7 +2318,7 @@ static void mymod_remarkTick() {
 					if (d < bestD) { bestD = d; best = c; }
 				}
 				if (best >= 0 && bestD < (double)(8 * 16) * (8 * 16)) {
-					if (Entity* f = mymod_remarkSpeaker(best, false)) {
+					if (Entity* f = mymod_remarkSpeaker(best, MYMOD_TIER_REACTIVE)) {
 						char extra[96];
 						snprintf(extra, sizeof(extra), ",\"effect\":\"%s\"", kind);
 						mymod_requestRemark(best, f, "fountain", extra);
@@ -2274,7 +2344,7 @@ static void mymod_remarkTick() {
 			if (pusher >= 0 && mymod_boulderPushed.insert(e->getUID()).second) {
 				const int who = pusher % MAXPLAYERS;
 				if (players[who] && players[who]->entity) {
-					if (Entity* f = mymod_remarkSpeaker(who, false)) {
+					if (Entity* f = mymod_remarkSpeaker(who, MYMOD_TIER_IDLE)) {
 						mymod_requestRemark(who, f, "boulderpush", "");
 					}
 				}
@@ -2322,7 +2392,7 @@ static void mymod_remarkTick() {
 					}
 				}
 				if (got >= 0) {
-					if (Entity* sp = mymod_remarkSpeaker(fowner, false)) {
+					if (Entity* sp = mymod_remarkSpeaker(fowner, MYMOD_TIER_EVENT)) {
 						// The one who was armed does the talking if it can.
 						Entity* voice = (sp == e) ? sp : e;
 						Item* fit = mymod_equipAt(es, got);
@@ -2350,7 +2420,7 @@ static void mymod_remarkTick() {
 					const double dy = e->y - players[c]->entity->y;
 					if (dx * dx + dy * dy > (double)(20 * 16) * (20 * 16)) continue;
 					// Allowed mid-fight: you meet a boss BY fighting it.
-					if (Entity* f = mymod_remarkSpeaker(c, false, true)) {
+					if (Entity* f = mymod_remarkSpeaker(c, MYMOD_TIER_REACTIVE)) {
 						mymod_bossAnnounced.insert(buid);
 						char extra[192];
 						snprintf(extra, sizeof(extra), ",\"look\":\"%s\"",
@@ -2385,7 +2455,7 @@ static void mymod_remarkTick() {
 			for (int c = 0; c < MAXPLAYERS; ++c) {
 				if (!players[c] || !players[c]->entity) continue;
 				// Allowed mid-fight -- a kill happens in one -- but it still waits its turn.
-				if (Entity* f = mymod_remarkSpeaker(c, false, true)) {
+				if (Entity* f = mymod_remarkSpeaker(c, MYMOD_TIER_IDLE, true)) {
 					char extra[160];
 					snprintf(extra, sizeof(extra), ",\"look\":\"%s\"",
 						mymod_jsonEscape(getMonsterLocalizedName((Monster)killedType)).c_str());
@@ -2407,7 +2477,7 @@ static void mymod_remarkTick() {
 			it = mymod_bossSeen.erase(it);
 			for (int c = 0; c < MAXPLAYERS; ++c) {
 				if (!players[c] || !players[c]->entity) continue;
-				if (Entity* f = mymod_remarkSpeaker(c, false, true)) {
+				if (Entity* f = mymod_remarkSpeaker(c, MYMOD_TIER_EVENT, true)) {
 					char extra[192];
 					snprintf(extra, sizeof(extra), ",\"look\":\"%s\"",
 						mymod_jsonEscape(bname).c_str());
@@ -2430,7 +2500,7 @@ static void mymod_remarkTick() {
 			mymod_floorCleared = true;
 			for (int c = 0; c < MAXPLAYERS; ++c) {
 				if (!players[c] || !players[c]->entity) continue;
-				if (Entity* f = mymod_remarkSpeaker(c, false)) {
+				if (Entity* f = mymod_remarkSpeaker(c, MYMOD_TIER_EVENT)) {
 					mymod_requestRemark(c, f, "cleared", "");
 					break;                       // one line for the party, not one each
 				}
@@ -2459,7 +2529,7 @@ static void mymod_remarkTick() {
 		if (best < 0 || bestD > (double)(24 * 16) * (24 * 16)) continue;
 		// ⚠ URGENT: skips the cooldown and the combat guard. A mimic is rare, it is already
 		// biting someone, and a warning that arrives twenty seconds later is not a warning.
-		if (Entity* f = mymod_remarkSpeaker(best, true, true)) {
+		if (Entity* f = mymod_remarkSpeaker(best, MYMOD_TIER_REACTIVE)) {
 			mymod_requestRemark(best, f, "mimic", "");
 		}
 	}
