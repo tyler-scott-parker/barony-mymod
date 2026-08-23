@@ -1462,6 +1462,7 @@ static void mymod_heckleTick() {
 static Entity* mymod_findFollower(int pnum);                    // defined below
 int mymod_appraisalValue(Item* it);                            // mirrors appraisalPossible
 static void mymod_requestValuable(int pnum, Entity* f, Item* it, int value);
+static void mymod_requestRemark(int pnum, Entity* f, const char* kind, const char* extra);
 
 static std::set<Uint32> mymod_seenItems[MAXPLAYERS];
 static bool  mymod_seenSeeded[MAXPLAYERS] = { false };
@@ -1471,6 +1472,44 @@ static Uint32 mymod_lastValuableTick = 0;
 // all read as "just picked up" the instant the run began.
 static const int MYMOD_VALUABLE_MIN = 1000;      // aquamarine and up; see the appraisal tiers
 static const Uint32 MYMOD_VALUABLE_COOLDOWN = 20 * 50;   // gems come in bunches; 20s apart
+
+// A follower eligible to say something right now: alive, this player's, and not already
+// mid-generation. `urgent` skips the shared cooldown and the combat guard -- a chest that turns
+// out to be a monster is worth interrupting for; an observation about the scenery is not.
+static Entity* mymod_remarkSpeaker(int pnum, bool urgent) {
+	if (pnum < 0 || pnum >= MAXPLAYERS) return nullptr;
+	if (!stats[pnum] || !players[pnum] || !players[pnum]->entity) return nullptr;
+	if (!urgent && ticks - mymod_lastValuableTick < MYMOD_VALUABLE_COOLDOWN) return nullptr;
+	if (mymod_convo[pnum].inflight.load() || mymod_anyPlayerBusy()) return nullptr;
+	Entity* f = mymod_findFollower(pnum);
+	if (!f) return nullptr;
+	Stat* fs = f->getStats();
+	if (!fs || fs->HP <= 0) return nullptr;
+	// ⚠ Not in the middle of a fight, for the calm remarks. Admiring a gemstone while something
+	// is biting you reads as broken rather than as character.
+	if (!urgent && mymod_inCombat[f->getUID()]) return nullptr;
+	mymod_lastValuableTick = ticks;
+	return f;
+}
+
+// ---- chest opened ------------------------------------------------------------------------
+// ⚠ Deliberately NOT every chest. They are common enough that a line each time becomes wallpaper,
+// and the whole design rule here is scarcity (spec 35/36).
+static const int MYMOD_CHEST_CHANCE = 35;          // percent, on top of the shared cooldown
+static bool mymod_chestWasOpen[MAXPLAYERS] = { false };
+
+// ---- the player is drunk -------------------------------------------------------------------
+// Rising edge only: they were sober, now they are not. Re-drinking while already drunk extends
+// the effect rather than re-triggering it, which is what a player actually does with booze.
+static bool mymod_wasDrunk[MAXPLAYERS] = { false };
+
+// ---- a chest that was a monster --------------------------------------------------------------
+// ⚠ A mimic is NOT a chest that transforms -- map generation REPLACES a chest with a MIMIC
+// monster entity at the chest's position (maps.cpp:10893), so it never touches openedChest and
+// the two detectors cannot collide. It sits in MIMIC_INERT looking like furniture and flips to
+// MIMIC_ACTIVE when disturbed (monster_mimic.cpp:1053); that flip is the moment worth shouting
+// about.
+static std::set<Uint32> mymod_seenMimics;
 
 static void mymod_valuablesTick() {
 	if (intro) return;
@@ -1493,14 +1532,63 @@ static void mymod_valuablesTick() {
 		}
 		mymod_seenSeeded[pnum] = true;
 		if (!found || bestValue < MYMOD_VALUABLE_MIN) continue;
-		if (ticks - mymod_lastValuableTick < MYMOD_VALUABLE_COOLDOWN) continue;
-		if (mymod_convo[pnum].inflight.load() || mymod_anyPlayerBusy()) continue;
-		Entity* f = mymod_findFollower(pnum);
-		if (!f) continue;
-		Stat* fs = f->getStats();
-		if (!fs || fs->HP <= 0) continue;
-		mymod_lastValuableTick = ticks;
-		mymod_requestValuable(pnum, f, found, bestValue);
+		if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+			mymod_requestValuable(pnum, f, found, bestValue);
+		}
+	}
+}
+
+// Chests, booze and mimics. Same shape as the inventory watch: an edge, a speaker, a line.
+static void mymod_remarkTick() {
+	if (intro) return;
+	for (int pnum = 0; pnum < MAXPLAYERS; ++pnum) {
+		if (!stats[pnum] || !players[pnum] || !players[pnum]->entity) continue;
+
+		// --- a treasure chest, opened ---
+		const bool chestOpen = (openedChest[pnum] != nullptr);
+		if (chestOpen && !mymod_chestWasOpen[pnum]
+			&& local_rng.rand() % 100 < MYMOD_CHEST_CHANCE) {
+			if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+				mymod_requestRemark(pnum, f, "chest", "");
+			}
+		}
+		mymod_chestWasOpen[pnum] = chestOpen;
+
+		// --- drunk ---
+		const bool drunk = stats[pnum]->getEffectActive(EFF_DRUNK);
+		if (drunk && !mymod_wasDrunk[pnum]) {
+			if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+				mymod_requestRemark(pnum, f, "drunk", "");
+			}
+		}
+		mymod_wasDrunk[pnum] = drunk;
+	}
+
+	// --- a mimic waking up ---
+	if (!map.entities) return;
+	for (node_t* nd = map.entities->first; nd != NULL; nd = nd->next) {
+		Entity* e = (Entity*)nd->element;
+		if (!e || e->behavior != &actMonster) continue;
+		const Monster r = e->getRace();
+		if (r != MIMIC && r != MINIMIMIC) continue;
+		if (e->monsterSpecialState != MIMIC_ACTIVE) continue;
+		Stat* es = e->getStats();
+		if (!es || es->HP <= 0) continue;
+		if (!mymod_seenMimics.insert(e->getUID()).second) continue;   // shouted once already
+		// Whose follower reacts: the nearest player with one.
+		int best = -1; double bestD = 1e18;
+		for (int c = 0; c < MAXPLAYERS; ++c) {
+			if (!players[c] || !players[c]->entity) continue;
+			const double dx = e->x - players[c]->entity->x, dy = e->y - players[c]->entity->y;
+			const double d = dx * dx + dy * dy;
+			if (d < bestD) { bestD = d; best = c; }
+		}
+		if (best < 0 || bestD > (double)(24 * 16) * (24 * 16)) continue;
+		// ⚠ URGENT: skips the cooldown and the combat guard. A mimic is rare, it is already
+		// biting someone, and a warning that arrives twenty seconds later is not a warning.
+		if (Entity* f = mymod_remarkSpeaker(best, true)) {
+			mymod_requestRemark(best, f, "mimic", "");
+		}
 	}
 }
 
@@ -1508,6 +1596,7 @@ void mymod_ambientTick() {
 	if (!mymod_isHost()) return;
 	mymod_heckleTick();
 	mymod_valuablesTick();
+	mymod_remarkTick();
 	// Fight-survival scan: runs first so combat is tracked every frame, even during
 	// conversations. Covers EVERY player's followers, not just the host's.
 	if (!intro && map.entities) {
@@ -2046,6 +2135,19 @@ static void mymod_requestValuable(int pnum, Entity* f, Item* it, int value) {
 	mymod_fireRequest(pnum, payload, f->getUID(), false, raceName.c_str());
 	mymod_log("valuable: p%d picked up %s (%d gold); %s remarks",
 		pnum, look ? look : "?", value, raceName.c_str());
+}
+
+// HOST: the plain remarks -- a chest opened, the player drunk, a mimic waking. No payload
+// beyond the kind: the service knows what each situation is, and the follower is reacting to
+// something both of them can see.
+static void mymod_requestRemark(int pnum, Entity* f, const char* kind, const char* extra) {
+	if (!f || !kind) return;
+	std::string raceName = getMonsterLocalizedName(f->getRace(), f->getStats());
+	char tail[256];
+	snprintf(tail, sizeof(tail), ",\"remark\":\"%s\"%s", kind, extra ? extra : "");
+	std::string payload = "{" + mymod_payloadHead(pnum, raceName, f->getUID(), "") + tail + "}";
+	mymod_fireRequest(pnum, payload, f->getUID(), false, raceName.c_str());
+	mymod_log("remark: %s -> p%d's %s", kind, pnum, raceName.c_str());
 }
 
 // CLIENT -> host ('MYID'): "here is the item I am holding out, and what it really is."
@@ -2682,8 +2784,11 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		for (int c = 0; c < MAXPLAYERS; ++c) {
 			mymod_seenItems[c].clear();
 			mymod_seenSeeded[c] = false;
+			mymod_chestWasOpen[c] = false;
+			mymod_wasDrunk[c] = false;
 		}
 		mymod_lastValuableTick = 0;
+		mymod_seenMimics.clear();
 		{ std::lock_guard<std::mutex> lk(mymod_traitsMutex); mymod_traits.clear(); }
 		mymod_watchLevel = -1;
 	}
