@@ -62,6 +62,9 @@ struct MymodConvo {
 	std::string action;         // "FOLLOW"/"DEFEND"/"WAIT"/"ATTACK"/"NONE"
 	std::string name;           // follower given-name ("" if none)
 	std::string boon;           // "item:TYPE:N" or "traps:" pending application
+	int         charge = 0;     // the mercenary's fee, in gold, pending deduction
+	std::string favour;         // a job he was just hired for, for the engine to perform
+	std::string quote;          // "kind:price" the engine should print
 	std::string haggle;         // "<shopkeeper uid>:<percent>" from a merchant negotiation
 	std::string sabotage;       // "minotaur" -- a spy spending the player's floor against them
 	std::string prefix;         // chat-line label, e.g. "[taunt] " or "Ada's Grix: "
@@ -696,9 +699,81 @@ static std::string       mymod_favourLine;     // handed to the main thread
 static std::string       mymod_favourKind;
 static uint32_t          mymod_favourWho = 0;
 static bool              mymod_favourDo  = false;
+static int               mymod_favourCharge = 0;   // the mercenary's fee, if he was hired
+static std::string       mymod_favourQuote;        // "kind:price" for the ENGINE to print
+static int               mymod_favourOwner = -1;
 static bool mymod_minoGuardUsed = false;       // once per RUN each -- not a free pass
 static bool mymod_sokobanDone   = false;
 static int  mymod_favourAskedLevel = -1;       // ask at most once per floor
+
+// ---- The mercenary's fee ------------------------------------------------------------------
+// ⚠ NO NEW PACKET. 'GOLD' (net.cpp:4788) is an ABSOLUTE SET of a client's gold that vanilla
+// already sends for exactly this purpose after the host changes the value (net.cpp:9426), so a
+// remote client resyncs for free -- unlike MYFG/MYHG, which had no vanilla equivalent.
+//
+// ⚠ Charging a REMOTE client races with their own shop. buyItemFromShop runs client-side
+// (interface/shopgui.cpp:1597 checks affordability against the client's own copy), so an
+// absolute set landing mid-purchase would clobber a transaction in flight. We simply do not
+// charge a player who has a shop open; the fee waits for the next reply.
+static bool mymod_canChargeNow(int pnum) {
+	if (pnum < 0 || pnum >= MAXPLAYERS || !stats[pnum]) return false;
+	return !(players[pnum] && players[pnum]->shopGUI.bOpen);
+}
+
+static void mymod_chargeGold(int pnum, int amount) {
+	if (pnum < 0 || pnum >= MAXPLAYERS || amount <= 0 || !stats[pnum]) return;
+	if (stats[pnum]->GOLD < 0) stats[pnum]->GOLD = 0;
+	if (amount > stats[pnum]->GOLD) amount = stats[pnum]->GOLD;   // never go negative
+	if (amount <= 0) return;
+	stats[pnum]->GOLD -= amount;
+	// The game's own coin sound -- what DGLD plays when you drop gold (net.cpp:8976) and what
+	// a bounty pays out with (entity.cpp:18497). This is the feedback that the deal went
+	// through: the player hears the money leave.
+	if (players[pnum] && players[pnum]->entity) {
+		playSoundEntity(players[pnum]->entity, 242 + local_rng.rand() % 4, 64);
+	}
+	if (multiplayer == SERVER && pnum > 0) {
+		strcpy((char*)net_packet->data, "GOLD");
+		SDLNet_Write32(stats[pnum]->GOLD, &net_packet->data[4]);
+		net_packet->address.host = net_clients[pnum - 1].host;
+		net_packet->address.port = net_clients[pnum - 1].port;
+		net_packet->len = 8;
+		sendPacketSafe(net_sock, -1, net_packet, pnum - 1);
+	}
+	messagePlayerColor(pnum, MESSAGE_INVENTORY, makeColorRGB(255, 216, 102),
+		"You hand over %d gold.", amount);
+	mymod_log("merc: charged p%d %d gold (%d left)", pnum, amount, (int)stats[pnum]->GOLD);
+}
+
+// ⚠ The ENGINE prints the figure, never the model. Measured in the haggle work: asked to quote
+// a price the 8B invents one, and it invented a number beside a shop window showing the real
+// one. The mercenary supplies the attitude; this supplies the arithmetic.
+static void mymod_printQuote(int pnum, const std::string& q, const std::string& who) {
+	const size_t c = q.rfind(':');
+	if (c == std::string::npos) return;
+	const int price = atoi(q.substr(c + 1).c_str());
+	if (price <= 0) return;
+	const std::string kind = q.substr(0, c);
+	const char* what = "for the job";
+	if (kind == "identify")      what = "to appraise it";
+	else if (kind == "minotaur") what = "to deal with it";
+	else if (kind == "sokoban")  what = "to clear the room";
+	messagePlayerColor(pnum, MESSAGE_HINT, makeColorRGB(255, 216, 102),
+		"(%s wants %d gold %s. Say yes to agree.)",
+		who.empty() ? "Your companion" : who.c_str(), price, what);
+}
+
+// How much loose gold is lying on this floor. Only the engine can know it, and it is what
+// lets the Sokoban fee be a CUT of what he recovers rather than a flat charge.
+static int mymod_goldOnFloor() {
+	int total = 0;
+	if (!map.entities) return 0;
+	for (node_t* nd = map.entities->first; nd != NULL; nd = nd->next) {
+		Entity* e = (Entity*)nd->element;
+		if (e && e->behavior == &actGoldBag) total += e->goldAmount;
+	}
+	return total;
+}
 
 static Entity* mymod_findMinotaurTimer() {
 	if (!map.entities) return nullptr;
@@ -733,14 +808,18 @@ static Entity* mymod_favourCandidate(int& outOwner) {
 
 static void mymod_favourFetch(const char* kind, uint32_t uid, const std::string& race, int owner) {
 	mymod_favourBusy.store(true);
+	// gold: what the player can pay. gold_here: what is lying on this floor, which is what
+	// prices Sokoban as a CUT rather than a fee. Both are things only the engine can know.
+	const int purse = (owner >= 0 && owner < MAXPLAYERS && stats[owner]) ? (int)stats[owner]->GOLD : 0;
+	const int here  = (!strcmp(kind, "sokoban")) ? mymod_goldOnFloor() : 0;
 	char payload[512];
 	snprintf(payload, sizeof(payload),
 		"{\"favour\":\"%s\",\"uid\":%u,\"race\":\"%s\",\"floor\":%d,"
-		"\"player\":%d,\"map\":\"%s\"}",
+		"\"player\":%d,\"map\":\"%s\",\"gold\":%d,\"gold_here\":%d}",
 		kind, (unsigned)uid, race.c_str(), currentlevel, owner,
-		mymod_jsonEscape(map.name).c_str());
+		mymod_jsonEscape(map.name).c_str(), purse, here);
 	std::string body = payload, server = mymod_ai_server, k = kind;
-	std::thread([body, server, uid, k]() {
+	std::thread([body, server, uid, k, owner]() {
 		std::string resp;
 		mymod_httpPost(server, body, resp);
 		{
@@ -749,6 +828,9 @@ static void mymod_favourFetch(const char* kind, uint32_t uid, const std::string&
 			mymod_favourDo   = (mymod_jsonField(resp, "act") == "1");
 			mymod_favourWho  = uid;
 			mymod_favourKind = k;
+			mymod_favourCharge = atoi(mymod_jsonField(resp, "charge").c_str());
+			mymod_favourQuote  = mymod_jsonField(resp, "quote");
+			mymod_favourOwner  = owner;
 		}
 		mymod_favourBusy.store(false);
 	}).detach();
@@ -815,21 +897,11 @@ static void mymod_sokobanTick() {
 	}
 }
 
-static void mymod_favourTick() {
-	// Deliver a finished answer first.
-	std::string line, kind; uint32_t who = 0; bool act = false;
-	{
-		std::lock_guard<std::mutex> lk(mymod_favourMutex);
-		if (!mymod_favourLine.empty() || mymod_favourDo) {
-			line.swap(mymod_favourLine);
-			kind.swap(mymod_favourKind);
-			who = mymod_favourWho;
-			act = mymod_favourDo;
-			mymod_favourDo = false;
-			mymod_favourWho = 0;
-		}
-	}
-	if (act && kind == "minotaur") {
+// Doing the job. Called from the favour poll for a companion who simply acts, and from the
+// conversation path for a mercenary the player has just agreed terms with -- the acceptance
+// arrives as ordinary speech, so the two entry points are unavoidable.
+static void mymod_performFavour(const std::string& kind, uint32_t who) {
+	if (kind == "minotaur") {
 		if (Entity* t = mymod_findMinotaurTimer()) {
 			list_RemoveNode(t->mynode);
 			mymod_minoGuardUsed = true;
@@ -837,11 +909,42 @@ static void mymod_favourTick() {
 			mymod_log("favour: follower %u headed off the minotaur on floor %d",
 				(unsigned)who, currentlevel);
 		}
-	} else if (act && kind == "sokoban") {
+	} else if (kind == "sokoban") {
 		mymod_sokobanDone = true;
 		mymod_solveSokoban();
 	}
+}
+
+static void mymod_favourTick() {
+	// Deliver a finished answer first.
+	std::string line, kind, quote; uint32_t who = 0; bool act = false;
+	int charge = 0, owner = -1;
+	{
+		std::lock_guard<std::mutex> lk(mymod_favourMutex);
+		if (!mymod_favourLine.empty() || mymod_favourDo) {
+			line.swap(mymod_favourLine);
+			kind.swap(mymod_favourKind);
+			quote.swap(mymod_favourQuote);
+			who = mymod_favourWho;
+			act = mymod_favourDo;
+			charge = mymod_favourCharge;
+			owner = mymod_favourOwner;
+			mymod_favourDo = false;
+			mymod_favourWho = 0;
+			mymod_favourCharge = 0;
+			mymod_favourOwner = -1;
+		}
+	}
+	// Paid, then the job, then the line: the coin sound is the confirmation the deal went
+	// through, so it lands before he reports having done the work.
+	if (charge > 0 && owner >= 0) mymod_chargeGold(owner, charge);
+	if (act) mymod_performFavour(kind, who);
 	if (!line.empty()) mymod_broadcastLine(who, "", line);
+	if (!quote.empty() && owner >= 0) {
+		Entity* qe = uidToEntity(who);
+		Stat* qs = qe ? qe->getStats() : nullptr;
+		mymod_printQuote(owner, quote, (qs && qs->name[0]) ? qs->name : "");
+	}
 
 	if (mymod_favourBusy.load() || intro || !map.entities) return;
 	if (currentlevel == mymod_favourAskedLevel) return;
@@ -855,11 +958,11 @@ static void mymod_favourTick() {
 	if (!want) return;
 	mymod_favourAskedLevel = currentlevel;      // ask once per floor, whatever the answer
 
-	int owner = -1;
-	Entity* g = mymod_favourCandidate(owner);
-	if (!g || owner < 0) return;
+	int askOwner = -1;
+	Entity* g = mymod_favourCandidate(askOwner);
+	if (!g || askOwner < 0) return;
 	mymod_favourFetch(want, g->getUID(),
-		getMonsterLocalizedName(g->getRace(), g->getStats()), owner);
+		getMonsterLocalizedName(g->getRace(), g->getStats()), askOwner);
 }
 
 // ---- Spy sabotage: clouding the map --------------------------------------------------------
@@ -1705,6 +1808,11 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 		std::string ident  = mymod_jsonField(body, "identify");
 		std::string hag    = mymod_jsonField(body, "haggle");
 		std::string sab    = mymod_jsonField(body, "sabotage");
+		// The mercenary: his fee, a job he has just been hired to do, and a price for the
+		// ENGINE to print (the model is forbidden from ever saying a number).
+		std::string chg    = mymod_jsonField(body, "charge");
+		std::string fav    = mymod_jsonField(body, "favour");
+		std::string quo    = mymod_jsonField(body, "quote");
 		if (action.empty()) action = "NONE";
 		if (ident.empty())  ident = "0";
 		mymod_trimTail(speech);
@@ -1732,6 +1840,7 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 			std::lock_guard<std::mutex> lock(c.mutex);
 			c.reply = speech; c.action = action; c.name = gname; c.boon = boon; c.haggle = hag;
 			c.sabotage = sab;
+			c.charge = atoi(chg.c_str()); c.favour = fav; c.quote = quo;
 		}
 		c.ready.store(true);
 	}).detach();
@@ -1746,13 +1855,18 @@ static std::string mymod_payloadHead(int pnum, const std::string& raceName, uint
 	std::string originKey;
 	const char* origin = mymod_originName(mymod_originOf(uidToEntity(uid), &originKey));
 	char buf[1024];
+	// What this player is carrying. Only the engine knows it and only the service may decide
+	// whether it is enough -- the model cannot check a balance, so affordability is resolved
+	// server-side like every other condition in this project.
+	const int purse = (stats[pnum]) ? (int)stats[pnum]->GOLD : 0;
 	snprintf(buf, sizeof(buf),
 		"\"race\":\"%s\",\"floor\":%d,\"map\":\"%s\",\"says\":\"%s\",\"uid\":%u,"
-		"\"player\":%d,\"player_name\":\"%s\",\"origin\":\"%s\",\"origin_key\":\"%s\"",
+		"\"player\":%d,\"player_name\":\"%s\",\"origin\":\"%s\",\"origin_key\":\"%s\","
+		"\"gold\":%d",
 		raceName.c_str(), currentlevel, mymod_jsonEscape(map.name).c_str(),
 		mymod_jsonEscape(says).c_str(), (unsigned)uid,
 		pnum, mymod_jsonEscape(playerName).c_str(),
-		origin, mymod_jsonEscape(originKey).c_str());
+		origin, mymod_jsonEscape(originKey).c_str(), purse);
 	return std::string(buf);
 }
 
@@ -2172,11 +2286,13 @@ static void mymod_broadcastLine(uint32_t speakerUID, const std::string& prefix, 
 static void mymod_deliverSlot(int slot) {
 	MymodConvo& cv = mymod_convo[slot];
 	if (!cv.ready.load()) return;
-	std::string reply, action, gname, boon, haggle, sabotage;
+	std::string reply, action, gname, boon, haggle, sabotage, favour, quote;
+	int charge = 0;
 	{
 		std::lock_guard<std::mutex> lock(cv.mutex);
 		reply = cv.reply; action = cv.action; gname = cv.name; boon = cv.boon; haggle = cv.haggle;
 		sabotage = cv.sabotage;
+		charge = cv.charge; favour = cv.favour; quote = cv.quote;
 	}
 	// Applied on the main thread, before the line is spoken: the tell should land at the same
 	// moment the clock starts, not after it.
@@ -2195,10 +2311,24 @@ static void mymod_deliverSlot(int slot) {
 	}
 	// Main thread: the price map is read from Item::buyValue on this thread too.
 	if (!haggle.empty()) { mymod_applyHaggle(haggle); cv.haggle.clear(); }
+	// The mercenary is PAID FIRST, then does the job -- the coin sound is the player's
+	// confirmation that the deal went through, and it should land before he reports the work.
+	// ⚠ Deferred while a shop is open: 'GOLD' is an absolute set and would clobber a
+	// client-side purchase in flight (interface/shopgui.cpp:1597).
+	{
+		const int payer = (slot < MAXPLAYERS) ? slot : clientnum;
+		if (charge > 0) {
+			if (mymod_canChargeNow(payer)) { mymod_chargeGold(payer, charge); cv.charge = 0; }
+			else                           { mymod_log("merc: fee of %d for p%d held, shop open",
+			                                           charge, payer); }
+		}
+		if (!favour.empty()) { mymod_performFavour(favour, cv.follower_uid); cv.favour.clear(); }
+	}
 	cv.ready.store(false);
 	cv.inflight.store(false);
 	cv.name.clear();
 	cv.boon.clear();
+	cv.quote.clear();
 
 	const bool isWorld = (slot == MYMOD_WORLD_SLOT);
 	const int pnum = isWorld ? clientnum : slot;
@@ -2296,6 +2426,12 @@ static void mymod_deliverSlot(int slot) {
 		prefix = buf;
 	}
 	mymod_broadcastLine(cv.speaker_uid, prefix, reply);
+	// The figure follows his words: he names his terms, then the engine states the number.
+	// He is forbidden from saying one himself, so without this the price is never quoted.
+	if (!quote.empty()) {
+		Stat* qs = follower ? follower->getStats() : nullptr;
+		mymod_printQuote(pnum, quote, (qs && qs->name[0]) ? qs->name : "");
+	}
 	cv.prefix.clear();
 	cv.speaker_uid = 0;
 
