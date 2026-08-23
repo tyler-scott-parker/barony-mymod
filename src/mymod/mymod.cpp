@@ -100,6 +100,10 @@ uint32_t mymod_herx_informant = 0;
 
 std::string mymod_ai_server = "http://localhost:5001";  // host-side only (BYO-model)
 bool mymod_ptt_down = false;                            // is the push-to-talk key currently held?
+// ⚠ Set only for the request that follows a transcription, and cleared as soon as it is read.
+// The log needs to tell a spoken line from a typed one: a mis-transcription reads as the player
+// saying something strange, and without this you cannot tell which it was.
+static bool mymod_voiceOrigin = false;
 
 // ---- ambient babble + combat taunt state (host only) ----
 static uint32_t mymod_next_babble_tick = 0;                // when the next babble may fire
@@ -636,6 +640,29 @@ static void mymod_transcribeClip(const std::vector<int16_t>& pcm) {
 }
 
 // One place decides what a finished utterance does, whichever transcriber produced it.
+// Words that turn a spoken line into a note instead of dialogue.
+static const char* MYMOD_NOTE_PREFIXES[] = { "note", "log", "bug", "todo", "mark" };
+
+// Returns the note body if this is a spoken note, or "" if it is ordinary speech.
+static std::string mymod_asSpokenNote(const std::string& vtext) {
+	std::string low;
+	for (char c : vtext) low += (char)tolower((unsigned char)c);
+	for (const char* pfx : MYMOD_NOTE_PREFIXES) {
+		const size_t n = strlen(pfx);
+		if (low.size() <= n || low.compare(0, n, pfx) != 0) continue;
+		// ⚠ Whole word only: "nothing here" and "logging off" are not notes. Whisper also
+		// punctuates, so a comma, colon or full stop counts as the separator too.
+		const char sep = low[n];
+		if (sep != ' ' && sep != ',' && sep != ':' && sep != '.') continue;
+		std::string body = vtext.substr(n);
+		while (!body.empty() && (body[0]==' '||body[0]==','||body[0]==':'||body[0]=='.')) {
+			body.erase(0, 1);
+		}
+		return body;
+	}
+	return "";
+}
+
 static void mymod_onTranscribed(std::string vtext) {
 	// Junk filter: needs at least one letter, which skips "", ". . ." and the confident
 	// nonsense every speech model emits when handed silence.
@@ -643,7 +670,26 @@ static void mymod_onTranscribed(std::string vtext) {
 	for (char c : vtext) { if ((c>='a'&&c<='z')||(c>='A'&&c<='Z')) { hasLetter = true; break; } }
 	mymod_trimTail(vtext, "\n\r ");
 	if (!hasLetter || vtext.size() < 2) return;
+
+	// ⚠ Every transcript is logged BEFORE anything is done with it. If whisper mangles a word,
+	// a strange follower reply looks like a model failure when it was a transcription failure --
+	// this is the line that tells them apart.
+	mymod_log("voice: heard \"%s\"", vtext.c_str());
+
+	// ⚠ SPOKEN NOTES. During a playtest your hands are on the keyboard and the mouse, so
+	// /ailog is exactly the thing you will not stop to type -- and an unrecorded observation is
+	// worth nothing an hour later.
+	const std::string note = mymod_asSpokenNote(vtext);
+	if (!note.empty()) {
+		// Marked as spoken: a dictated note that reads as nonsense is usually whisper
+		// mishearing it, and the raw transcript above is the check.
+		mymod_playerNote(clientnum, "(spoken) " + note);
+		messagePlayerColor(clientnum, MESSAGE_HINT, makeColorRGB(150, 210, 255),
+			"(noted: %s)", note.c_str());
+		return;                       // a note is not something you say to your follower
+	}
 	messagePlayer(clientnum, MESSAGE_MISC, "[MYMOD] you said: %s", vtext.c_str());
+	mymod_voiceOrigin = true;         // tags the next payload; see mymod_payloadHead
 	mymod_sendToFollower(vtext);
 }
 
@@ -3219,6 +3265,10 @@ static std::string mymod_payloadHead(int pnum, const std::string& raceName, uint
 		origin, mymod_jsonEscape(originKey).c_str(), purse,
 		mymod_jsonEscape(playerRace).c_str(), mymod_jsonEscape(engineName).c_str(),
 		(int)mymod_persistIdOf(uidToEntity(uid)));
+	if (mymod_voiceOrigin) {
+		mymod_voiceOrigin = false;      // one request only
+		return std::string(buf) + ",\"via\":\"voice\"";
+	}
 	return std::string(buf);
 }
 
