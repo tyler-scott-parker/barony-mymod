@@ -1476,7 +1476,10 @@ static const Uint32 MYMOD_VALUABLE_COOLDOWN = 20 * 50;   // gems come in bunches
 // A follower eligible to say something right now: alive, this player's, and not already
 // mid-generation. `urgent` skips the shared cooldown and the combat guard -- a chest that turns
 // out to be a monster is worth interrupting for; an observation about the scenery is not.
-static Entity* mymod_remarkSpeaker(int pnum, bool urgent) {
+// `urgent` skips the shared cooldown; `inFight` allows speaking mid-combat. Most remarks want
+// neither -- admiring a gemstone while something is biting you reads as broken rather than as
+// character -- but a kill happens IN a fight, and a mimic or an arrow is worth interrupting for.
+static Entity* mymod_remarkSpeaker(int pnum, bool urgent, bool inFight = false) {
 	if (pnum < 0 || pnum >= MAXPLAYERS) return nullptr;
 	if (!stats[pnum] || !players[pnum] || !players[pnum]->entity) return nullptr;
 	if (!urgent && ticks - mymod_lastValuableTick < MYMOD_VALUABLE_COOLDOWN) return nullptr;
@@ -1485,9 +1488,7 @@ static Entity* mymod_remarkSpeaker(int pnum, bool urgent) {
 	if (!f) return nullptr;
 	Stat* fs = f->getStats();
 	if (!fs || fs->HP <= 0) return nullptr;
-	// ⚠ Not in the middle of a fight, for the calm remarks. Admiring a gemstone while something
-	// is biting you reads as broken rather than as character.
-	if (!urgent && mymod_inCombat[f->getUID()]) return nullptr;
+	if (!urgent && !inFight && mymod_inCombat[f->getUID()]) return nullptr;
 	mymod_lastValuableTick = ticks;
 	return f;
 }
@@ -1558,8 +1559,50 @@ static int mymod_hungerStateOf(int pnum) {
 	return MYMOD_HUNGER_NORMAL;
 }
 
-// ---- swimming ------------------------------------------------------------------------------
+// ---- swimming, and the things it does to some of you ---------------------------------------
+// ⚠ isPlayerSwimming() is TRUE IN LAVA TOO (actplayer.cpp:3616 tests swimmingtiles || lavatiles),
+// so "swimming" on its own would have a follower admiring the player's stroke while they burn.
+// And two player races are hurt by ordinary water, which the game states outright:
+//
+//   vampire in water   "Your flesh sears in pain as you make contact with the water!"  (lang 3183)
+//   automaton in water "Cool water is flooding your boiler!"                           (lang 3702)
+//   automaton in lava  "The lava overheats your boiler!"                               (lang 3703)
+//   anyone in lava     "You've fallen in boiling lava!"                                (lang 573)
+//
+// ⚠ The automaton case is the SAME boiler the hunger remarks read: water is HUNGER -= 25
+// (actplayer.cpp:9542), draining it toward CRITICAL, and lava drives it the other way. So the
+// follower should be shouting about the boiler, not about catching a chill.
 static bool mymod_wasSwimming[MAXPLAYERS] = { false };
+
+// 0 = dry, 1 = water, 2 = lava.
+static int mymod_swimMedium(int pnum) {
+	if (!players[pnum] || !players[pnum]->entity || !map.tiles) return 0;
+	Entity* my = players[pnum]->entity;
+	const int x = std::min(std::max(0, (int)floor(my->x / 16)), (int)map.width - 1);
+	const int y = std::min(std::max(0, (int)floor(my->y / 16)), (int)map.height - 1);
+	const int t = map.tiles[y * MAPLAYERS + x * MAPLAYERS * map.height];
+	if (lavatiles[t]) return 2;
+	if (swimmingtiles[t]) return 1;
+	return 0;
+}
+
+// Which race-specific harm applies, in the game's own terms.
+static const char* mymod_swimHazard(int pnum, int medium) {
+	if (!stats[pnum]) return "";
+	const Monster t = stats[pnum]->type;
+	if (t == AUTOMATON) return "automaton";          // boiler: flooded in water, overheated in lava
+	if (medium == 1 && t == VAMPIRE) return "vampire";
+	return "";
+}
+
+// ---- the party killing something -------------------------------------------------------------
+// ⚠ kills[] is the game's own per-run tally, credited to a player (entity.cpp:18411 for the host,
+// net.cpp:5225 for a client) and cleared on a new game. So an edge on it means "your side just
+// killed something", and the index says WHAT -- which is the whole flavour of the line.
+static int mymod_lastKills[NUMMONSTERS] = { 0 };
+static bool mymod_killsSeeded = false;
+// Kills are frequent; this is a garnish, not a commentary track.
+static const int MYMOD_KILL_CHANCE = 10;          // percent, on top of the shared cooldown
 
 // ---- floor cleared --------------------------------------------------------------------------
 // ⚠ Barony has NO concept of a cleared floor -- there is no flag, no message and no counter, so
@@ -1674,12 +1717,19 @@ static void mymod_remarkTick() {
 			}
 		}
 
-		// --- swimming ---
-		const bool swimming = (players[pnum]->movement.isPlayerSwimming()
+		// --- swimming, or standing in lava ---
+		const int medium = mymod_swimMedium(pnum);
+		const bool swimming = (medium != 0) && (players[pnum]->movement.isPlayerSwimming()
 			|| (players[pnum]->entity && players[pnum]->entity->skill[13] != 0));
 		if (swimming && !mymod_wasSwimming[pnum]) {
-			if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
-				mymod_requestRemark(pnum, f, "swimming", "");
+			// ⚠ Lava is urgent and may be shouted mid-fight: it is doing damage every tick and
+			// a line twenty seconds later would be an obituary.
+			const bool lava = (medium == 2);
+			if (Entity* f = mymod_remarkSpeaker(pnum, lava, lava)) {
+				char extra[128];
+				snprintf(extra, sizeof(extra), ",\"medium\":\"%s\",\"hazard\":\"%s\"",
+					lava ? "lava" : "water", mymod_swimHazard(pnum, medium));
+				mymod_requestRemark(pnum, f, "swimming", extra);
 			}
 		}
 		mymod_wasSwimming[pnum] = swimming;
@@ -1692,7 +1742,7 @@ static void mymod_remarkTick() {
 			&& mymod_trapArrowNear[pnum] != 0
 			&& ticks - mymod_trapArrowNear[pnum] <= 6) {
 			mymod_trapArrowNear[pnum] = 0;      // one line per volley, not per arrow
-			if (Entity* f = mymod_remarkSpeaker(pnum, true)) {
+			if (Entity* f = mymod_remarkSpeaker(pnum, true, true)) {
 				mymod_requestRemark(pnum, f, "arrowtrap", "");
 			}
 		}
@@ -1741,6 +1791,35 @@ static void mymod_remarkTick() {
 			if (players[c]->entity->checkEnemy(e)) { ++hostiles; break; }
 		}
 	}
+	// --- the party killed something ---
+	// Cheap: one pass over a 53-entry array, only on the once-a-second scan.
+	if (scanClear) {
+		int killedType = -1;
+		for (int t = 0; t < NUMMONSTERS; ++t) {
+			if (kills[t] > mymod_lastKills[t]) {
+				if (killedType < 0) killedType = t;
+				mymod_lastKills[t] = kills[t];
+			} else if (kills[t] < mymod_lastKills[t]) {
+				mymod_lastKills[t] = kills[t];      // a new run reset the tally
+			}
+		}
+		// ⚠ Seed silently: the first pass of a run must not report the previous run's tally.
+		if (killedType >= 0 && mymod_killsSeeded
+			&& local_rng.rand() % 100 < MYMOD_KILL_CHANCE) {
+			for (int c = 0; c < MAXPLAYERS; ++c) {
+				if (!players[c] || !players[c]->entity) continue;
+				// Allowed mid-fight -- a kill happens in one -- but it still waits its turn.
+				if (Entity* f = mymod_remarkSpeaker(c, false, true)) {
+					char extra[160];
+					snprintf(extra, sizeof(extra), ",\"look\":\"%s\"",
+						mymod_jsonEscape(getMonsterLocalizedName((Monster)killedType)).c_str());
+					mymod_requestRemark(c, f, "kill", extra);
+					break;                          // one line for the party
+				}
+			}
+		}
+		mymod_killsSeeded = true;
+	}
 	if (scanClear) {
 		if (currentlevel != mymod_clearLevel) {
 			mymod_clearLevel = currentlevel;
@@ -1783,7 +1862,7 @@ static void mymod_remarkTick() {
 		if (best < 0 || bestD > (double)(24 * 16) * (24 * 16)) continue;
 		// ⚠ URGENT: skips the cooldown and the combat guard. A mimic is rare, it is already
 		// biting someone, and a warning that arrives twenty seconds later is not a warning.
-		if (Entity* f = mymod_remarkSpeaker(best, true)) {
+		if (Entity* f = mymod_remarkSpeaker(best, true, true)) {
 			mymod_requestRemark(best, f, "mimic", "");
 		}
 	}
@@ -2993,6 +3072,8 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		mymod_floorHadEnemies = false;
 		mymod_floorCleared = false;
 		mymod_clearLevel = -1;
+		for (int t = 0; t < NUMMONSTERS; ++t) mymod_lastKills[t] = 0;
+		mymod_killsSeeded = false;
 		{ std::lock_guard<std::mutex> lk(mymod_traitsMutex); mymod_traits.clear(); }
 		mymod_watchLevel = -1;
 	}
