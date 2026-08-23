@@ -1796,6 +1796,68 @@ static const char* mymod_skillTier(int v) {
 	return "hopeless";
 }
 
+// ---- The rat -----------------------------------------------------------------------------------
+// An easter egg. Walk a RAT follower all the way to the Baron -- or to the Archmagisters at the
+// very bottom -- and there is a coin-flip chance the boss simply cannot cope with it.
+//
+// ⚠ Nothing is spawned and no portal is created. Both winning portals sit INVISIBLE on their
+// floor already and reveal themselves the moment no boss of the right kind is left in
+// map.creatures (actladder.cpp:460 for LICH/DEVIL, :721 for LICH_FIRE/LICH_ICE). So the whole
+// mechanism is "the boss dies", and the game does the rest.
+//
+// ⚠ Setting HP to 0 is the RIGHT kill, not a shortcut: actmonster.cpp:4008/4074 give LICH and
+// LICH_FIRE their own death states from the ordinary HP<=0 path, so the boss gets its proper
+// death animation, its drops and its removal from the creature list.
+//
+// ⚠ BOTH twins have to go. The sanctum portal returns early if EITHER LICH_FIRE or LICH_ICE is
+// still standing, so killing one and leaving the other would strand the player at the bottom of
+// the game with no exit -- the exact "half-fired ending" failure the peaceful-Herx design note
+// warns about.
+static void mymod_fireRequest(int pnum, const std::string& payload,
+                              uint32_t targetUID, bool isNPC, const char* logWhat);  // below
+
+static const int MYMOD_RATFEAR_PERCENT = 50;
+static const double MYMOD_RATFEAR_RANGE = 12 * 16;
+static std::set<uint32_t> mymod_ratfearRolled;   // bosses already coin-flipped, per floor
+static bool   mymod_ratfearArmed = false;        // line requested, kill pending
+static int    mymod_ratfearPlayer = -1;
+static Uint32 mymod_ratfearKillAt = 0;
+static bool   mymod_ratfearTwins = false;
+
+// A rat this player brought all the way down here, still alive and close to the boss.
+static Entity* mymod_ratNear(Entity* boss) {
+	if (!boss || !map.entities) return nullptr;
+	for (node_t* nd = map.entities->first; nd != NULL; nd = nd->next) {
+		Entity* e = (Entity*)nd->element;
+		if (!e || e->behavior != &actMonster) continue;
+		if (e->getRace() != RAT) continue;
+		if (mymod_ownerOf(e) < 0) continue;              // it has to be THEIRS
+		Stat* es = e->getStats();
+		if (!es || es->HP <= 0) continue;
+		const double dx = e->x - boss->x, dy = e->y - boss->y;
+		if (dx * dx + dy * dy <= MYMOD_RATFEAR_RANGE * MYMOD_RATFEAR_RANGE) return e;
+	}
+	return nullptr;
+}
+
+static void mymod_ratfearKill() {
+	if (!map.entities) return;
+	int n = 0;
+	for (node_t* nd = map.entities->first; nd != NULL; nd = nd->next) {
+		Entity* e = (Entity*)nd->element;
+		if (!e || e->behavior != &actMonster) continue;
+		const Monster r = e->getRace();
+		const bool twin = (r == LICH_FIRE || r == LICH_ICE);
+		if (mymod_ratfearTwins ? !twin : (r != LICH)) continue;
+		Stat* es = e->getStats();
+		if (!es || es->HP <= 0) continue;
+		e->setObituary("was frightened to death by a rat.");
+		es->HP = 0;                       // actmonster.cpp gives it its own death state from here
+		++n;
+	}
+	mymod_log("ratfear: %d boss(es) undone by a rat on floor %d", n, currentlevel);
+}
+
 // ---- major bosses ----------------------------------------------------------------------------
 // ⚠ Tracked as ENTITIES, not through kills[]. The tally only gives a race index, and a race is
 // not an identity here: LICH_ICE/LICH_FIRE are Erudyce and Orpheus only when spawned as the
@@ -2256,6 +2318,7 @@ static void mymod_remarkTick() {
 		mymod_bossSeen.clear();
 		mymod_bossAnnounced.clear();
 		mymod_minoTimerSeen = false;
+		mymod_ratfearRolled.clear();
 	}
 
 	// --- the countdown starting ---
@@ -2413,6 +2476,32 @@ static void mymod_remarkTick() {
 				? std::string(es->name)
 				: getMonsterLocalizedName(e->getRace(), es));
 			mymod_bossSeen[buid] = std::make_pair(bname, isMino);
+			// --- the rat ---
+			if (!isMino && !mymod_ratfearArmed && !mymod_ratfearRolled.count(buid)) {
+				if (Entity* rat = mymod_ratNear(e)) {
+					mymod_ratfearRolled.insert(buid);      // one flip per boss, win or lose
+					const int owner = mymod_ownerOf(rat);
+					if (owner >= 0 && local_rng.rand() % 100 < MYMOD_RATFEAR_PERCENT
+						&& !mymod_convo[owner].inflight.load()) {
+						mymod_ratfearArmed = true;
+						mymod_ratfearPlayer = owner;
+						mymod_ratfearTwins = (e->getRace() != LICH);
+						mymod_ratfearKillAt = 0;
+						// ⚠ Fired as an NPC so deliverSlot takes the non-follower branch: a
+						// bubble and a chat line, and none of the boons, renaming or ALLY_CMD
+						// machinery that a follower reply drags along.
+						char payload[512];
+						snprintf(payload, sizeof(payload),
+							"{\"ratfear\":true,\"race\":\"%s\",\"floor\":%d,\"map\":\"%s\","
+							"\"player\":%d,\"boss\":\"%s\"}",
+							mymod_jsonEscape(getMonsterLocalizedName(e->getRace(), es)).c_str(),
+							currentlevel, mymod_jsonEscape(map.name).c_str(), owner,
+							mymod_jsonEscape(bname).c_str());
+						mymod_fireRequest(owner, payload, buid, true, "the Baron (rat)");
+						mymod_log("ratfear: TRIGGERED on %s by p%d's rat", bname.c_str(), owner);
+					}
+				}
+			}
 			if (!mymod_bossAnnounced.count(buid)) {
 				for (int c = 0; c < MAXPLAYERS; ++c) {
 					if (!players[c] || !players[c]->entity) continue;
@@ -2466,6 +2555,23 @@ static void mymod_remarkTick() {
 		}
 		mymod_killsSeeded = true;
 	}
+	// --- the rat: kill a beat AFTER the line has landed ---
+	// ⚠ The boss has to speak first. Killing on the request would put the line over a corpse
+	// two seconds later; waiting for the slot to clear means the bubble is already up, and the
+	// extra beat is what makes it land as a joke rather than as a glitch.
+	if (mymod_ratfearArmed && mymod_ratfearPlayer >= 0) {
+		if (mymod_ratfearKillAt == 0) {
+			if (!mymod_convo[mymod_ratfearPlayer].inflight.load()) {
+				mymod_ratfearKillAt = ticks + 75;      // ~1.5s
+			}
+		} else if (ticks >= mymod_ratfearKillAt) {
+			mymod_ratfearKill();
+			mymod_ratfearArmed = false;
+			mymod_ratfearPlayer = -1;
+			mymod_ratfearKillAt = 0;
+		}
+	}
+
 	// --- a boss that was here and is not any more ---
 	if (scanClear) {
 		for (auto it = mymod_bossSeen.begin(); it != mymod_bossSeen.end(); ) {
@@ -3767,6 +3873,10 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		mymod_bossAnnounced.clear();
 		mymod_bossLevel = -1;
 		mymod_minoTimerSeen = false;
+		mymod_ratfearRolled.clear();
+		mymod_ratfearArmed = false;
+		mymod_ratfearPlayer = -1;
+		mymod_ratfearKillAt = 0;
 		mymod_lastMapName.clear();
 		mymod_skillLevel = -1;
 		mymod_followerKit.clear();
