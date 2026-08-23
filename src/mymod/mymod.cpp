@@ -181,6 +181,35 @@ static bool mymod_isEmplacement(Entity* e) {
 // directly, so an AI-chosen name makes a skeleton knight stop being one.
 static const int MYMOD_RAT_SLAYER = 21;   // MISC_FLAGS index; see the rat easter egg
 
+// ---- Follower identity that survives a staircase ------------------------------------------
+// ⚠ THE PROBLEM, confirmed in the first real session: follower_state is keyed by entity uid,
+// and a level change RE-CREATES every follower as a brand new entity (game.cpp:2438 ->
+// summonMonster) with a fresh uid (entity_shared.cpp:490). Floor 1 carried skeleton 441,
+// skeleton 438 and rat 439; floor 2 carried skeleton 1040, skeleton 1042 and rat 1043 -- same
+// party, new uids, and the ALLEGIANCE was re-rolled, which only happens when a new state row is
+// created. Friendship, events and the assigned name all restarted, so every gate above ~5 was
+// unreachable in real play.
+//
+// ⚠ THE FIX reuses what already works. Summons and bots survive their own bodies through
+// PERSISTENT_IDENTITY, keyed by (origin, player, origin_key); ordinary followers just had no
+// key. So the engine stamps one into the creature's Stat, which copyStats() carries across the
+// transition (stat.cpp:679) exactly as it carries the name and the rat-slayer mark.
+static const int MYMOD_PERSIST_ID = 22;   // MISC_FLAGS index; 16 and 23-31 still free
+static Sint32 mymod_persistNext = 1;
+static int mymod_ownerOf(Entity* mon);    // defined below
+
+// Assigned lazily and only to real followers -- an NPC or a hostile has no relationship to keep.
+static Sint32 mymod_persistIdOf(Entity* e) {
+	if (!e || e->behavior != &actMonster) return 0;
+	if (mymod_ownerOf(e) < 0) return 0;
+	Stat* st = e->getStats();
+	if (!st) return 0;
+	if (st->MISC_FLAGS[MYMOD_PERSIST_ID] == 0) {
+		st->MISC_FLAGS[MYMOD_PERSIST_ID] = mymod_persistNext++;
+	}
+	return st->MISC_FLAGS[MYMOD_PERSIST_ID];
+}
+
 static bool mymod_nameIsLoadBearing(Entity* e) {
 	if (!e) return false;
 	Stat* s = e->getStats();
@@ -3183,12 +3212,13 @@ static std::string mymod_payloadHead(int pnum, const std::string& raceName, uint
 	snprintf(buf, sizeof(buf),
 		"\"race\":\"%s\",\"floor\":%d,\"map\":\"%s\",\"says\":\"%s\",\"uid\":%u,"
 		"\"player\":%d,\"player_name\":\"%s\",\"origin\":\"%s\",\"origin_key\":\"%s\","
-		"\"gold\":%d,\"player_kind\":\"%s\",\"follower_name\":\"%s\"",
+		"\"gold\":%d,\"player_kind\":\"%s\",\"follower_name\":\"%s\",\"persist\":%d",
 		raceName.c_str(), currentlevel, mymod_jsonEscape(map.name).c_str(),
 		mymod_jsonEscape(says).c_str(), (unsigned)uid,
 		pnum, mymod_jsonEscape(playerName).c_str(),
 		origin, mymod_jsonEscape(originKey).c_str(), purse,
-		mymod_jsonEscape(playerRace).c_str(), mymod_jsonEscape(engineName).c_str());
+		mymod_jsonEscape(playerRace).c_str(), mymod_jsonEscape(engineName).c_str(),
+		(int)mymod_persistIdOf(uidToEntity(uid)));
 	return std::string(buf);
 }
 
@@ -3999,11 +4029,13 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		mymod_killsSeeded = false;
 		{ std::lock_guard<std::mutex> lk(mymod_traitsMutex); mymod_traits.clear(); }
 		mymod_watchLevel = -1;
+		mymod_persistNext = 1;
 	}
 	std::string t = etype ? etype : "";
 	std::string r = getMonsterLocalizedName((Monster)raceEnum);
 	if (r.empty()) r = "monster";
 	int owner = 0;
+	int persist = 0;
 	std::string originKey;
 	std::string origin;
 	if (uid) {
@@ -4014,18 +4046,23 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		// a bot rebinds to whatever relationship its predecessor built, so the key has to
 		// ride along with the event that creates the state.
 		origin = mymod_originName(mymod_originOf(who, &originKey));
+		// ⚠ Same reasoning for an ordinary follower: recruitment is where its state row is
+		// created, so the token that will find that row again after a staircase has to be
+		// stamped and sent HERE, not on first conversation.
+		persist = (int)mymod_persistIdOf(who);
 	}
 	uint32_t u = uid;
 	uint32_t ab = about;
 	int fl = floor;
+	const int pid = persist;
 	std::string server = mymod_ai_server;
-	std::thread([t, r, u, ab, fl, owner, origin, originKey, server]() {
+	std::thread([t, r, u, ab, fl, owner, origin, originKey, server, pid]() {
 		char body[512];
 		snprintf(body, sizeof(body),
 			"{\"event\":\"%s\",\"race\":\"%s\",\"floor\":%d,\"uid\":%u,\"player\":%d,"
-			"\"origin\":\"%s\",\"origin_key\":\"%s\",\"about\":%u}",
+			"\"origin\":\"%s\",\"origin_key\":\"%s\",\"about\":%u,\"persist\":%d}",
 			t.c_str(), r.c_str(), fl, (unsigned)u, owner,
-			origin.c_str(), mymod_jsonEscape(originKey).c_str(), (unsigned)ab);
+			origin.c_str(), mymod_jsonEscape(originKey).c_str(), (unsigned)ab, pid);
 		std::string resp;
 		mymod_httpPost(server, body, resp);
 		const std::string tr = mymod_jsonField(resp, "traits");
