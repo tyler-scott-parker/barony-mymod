@@ -758,6 +758,7 @@ static void mymod_printQuote(int pnum, const std::string& q, const std::string& 
 	if (kind == "identify")      what = "to appraise it";
 	else if (kind == "minotaur") what = "to deal with it";
 	else if (kind == "sokoban")  what = "to clear the room";
+	else if (kind == "map")      what = "for the layout of this floor";
 	messagePlayerColor(pnum, MESSAGE_HINT, makeColorRGB(255, 216, 102),
 		"(%s wants %d gold %s. Say yes to agree.)",
 		who.empty() ? "Your companion" : who.c_str(), price, what);
