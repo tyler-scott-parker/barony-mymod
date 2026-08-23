@@ -1633,6 +1633,50 @@ static Entity* mymod_deathSpeaker(int dead, int& outOwner) {
 	return other;
 }
 
+// ---- major bosses ----------------------------------------------------------------------------
+// ⚠ Tracked as ENTITIES, not through kills[]. The tally only gives a race index, and a race is
+// not an identity here: LICH_ICE/LICH_FIRE are Erudyce and Orpheus only when spawned as the
+// named pair (stat_shared.cpp:918/946) and are ordinary elemental liches otherwise. Watching the
+// entity lets us read stats->name -- "Baphomet", "Baron Herx", "Erudyce", "Orpheus" -- and be
+// right in both cases.
+static bool mymod_isBossRace(Monster r) {
+	return r == LICH || r == DEVIL || r == LICH_FIRE || r == LICH_ICE;
+}
+static std::map<uint32_t, std::string> mymod_bossSeen;   // uid -> display name, while alive
+static std::set<uint32_t> mymod_bossAnnounced;           // already shouted about, this floor
+static int mymod_bossLevel = -1;
+
+// ---- special and optional areas ---------------------------------------------------------------
+// ⚠ Keyed on the map's INTERNAL name, which is what the mod already sends. Several do not match
+// their filename at all -- hamlet.lmp is "Mages Guild" -- so these were read out of the .lmp
+// headers rather than guessed.
+static const struct { const char* mapName; const char* area; } MYMOD_AREAS[] = {
+	{"Mages Guild",       "Hamlet, the town beneath the world"},
+	{"Minetown",          "Minetown"},
+	{"The Gnomish Mines", "the Gnomish Mines"},
+	{"Sokoban",           "a sealed vault full of boulders and pits"},
+	{"The Minotaur Maze", "the Minotaur Maze"},
+	{"The Temple",        "the Temple"},
+	{"Underworld",        "the Underworld"},
+	{"Bram's Castle",     "Bram's Castle"},
+	{"The Haunted Castle","the Haunted Castle"},
+	{"The Mystic Library","the Mystic Library"},
+	{"Cockatrice Lair",   "the Cockatrice Lair"},
+	{"Sanctum",           "the Sanctum at the top of the Citadel"},
+	{"Boss",              "the lair of Baron Herx"},
+	{"Hell Boss",         "Baphomet's throne room"},
+};
+static std::string mymod_lastMapName;
+static bool mymod_areaSeeded = false;
+
+static const char* mymod_areaName(const char* mapName) {
+	if (!mapName) return nullptr;
+	for (const auto& a : MYMOD_AREAS) {
+		if (!strcmp(mapName, a.mapName)) return a.area;
+	}
+	return nullptr;
+}
+
 // ---- the party killing something -------------------------------------------------------------
 // ⚠ kills[] is the game's own per-run tally, credited to a player (entity.cpp:18411 for the host,
 // net.cpp:5225 for a client) and cleared on a new game. So an edge on it means "your side just
@@ -1820,6 +1864,37 @@ static void mymod_remarkTick() {
 
 	if (!map.entities) return;
 
+	// --- a special or optional area, on arrival ---
+	// Fires on the map NAME changing, not the floor number: secret levels and the DLC share
+	// floor numbers with ordinary ones, and only the name tells them apart.
+	if (mymod_lastMapName != map.name) {
+		mymod_lastMapName = map.name;
+		if (const char* area = mymod_areaName(map.name)) {
+			// ⚠ Seed silently: whatever map is loaded when the mod first ticks was not "entered".
+			if (mymod_areaSeeded) {
+				for (int c = 0; c < MAXPLAYERS; ++c) {
+					if (!players[c] || !players[c]->entity) continue;
+					if (Entity* f = mymod_remarkSpeaker(c, false)) {
+						char extra[192];
+						snprintf(extra, sizeof(extra), ",\"look\":\"%s\"",
+							mymod_jsonEscape(area).c_str());
+						mymod_requestRemark(c, f, "area", extra);
+						break;                    // one line for the party
+					}
+				}
+			}
+		}
+		mymod_areaSeeded = true;
+	}
+
+	// ⚠ Bosses are per-floor: leaving Herx's lair replaces the entity list, which would read
+	// exactly like his death.
+	if (currentlevel != mymod_bossLevel) {
+		mymod_bossLevel = currentlevel;
+		mymod_bossSeen.clear();
+		mymod_bossAnnounced.clear();
+	}
+
 	// --- trap arrows in flight, and whether the floor still has anything hostile on it ---
 	const bool scanClear = (ticks >= mymod_nextClearScan);
 	if (scanClear) mymod_nextClearScan = ticks + 50;    // once a second is plenty
@@ -1844,6 +1919,31 @@ static void mymod_remarkTick() {
 		if (!scanClear || e->behavior != &actMonster) continue;
 		Stat* es = e->getStats();
 		if (!es || es->HP <= 0) continue;
+		// --- a major boss, alive and in the room ---
+		if (mymod_isBossRace(e->getRace())) {
+			const uint32_t buid = e->getUID();
+			const std::string bname = (es->name[0]
+				? std::string(es->name)
+				: getMonsterLocalizedName(e->getRace(), es));
+			mymod_bossSeen[buid] = bname;
+			if (!mymod_bossAnnounced.count(buid)) {
+				for (int c = 0; c < MAXPLAYERS; ++c) {
+					if (!players[c] || !players[c]->entity) continue;
+					const double dx = e->x - players[c]->entity->x;
+					const double dy = e->y - players[c]->entity->y;
+					if (dx * dx + dy * dy > (double)(20 * 16) * (20 * 16)) continue;
+					// Allowed mid-fight: you meet a boss BY fighting it.
+					if (Entity* f = mymod_remarkSpeaker(c, false, true)) {
+						mymod_bossAnnounced.insert(buid);
+						char extra[192];
+						snprintf(extra, sizeof(extra), ",\"look\":\"%s\"",
+							mymod_jsonEscape(bname).c_str());
+						mymod_requestRemark(c, f, "bossfight", extra);
+					}
+					break;
+				}
+			}
+		}
 		// checkEnemy against a real player: honours everybodyfriendly, followers and townsfolk.
 		for (int c = 0; c < MAXPLAYERS; ++c) {
 			if (!players[c] || !players[c]->entity) continue;
@@ -1878,6 +1978,26 @@ static void mymod_remarkTick() {
 			}
 		}
 		mymod_killsSeeded = true;
+	}
+	// --- a boss that was here and is not any more ---
+	if (scanClear) {
+		for (auto it = mymod_bossSeen.begin(); it != mymod_bossSeen.end(); ) {
+			Entity* be = uidToEntity(it->first);
+			Stat* bs = be ? be->getStats() : nullptr;
+			if (be && bs && bs->HP > 0) { ++it; continue; }
+			const std::string bname = it->second;
+			it = mymod_bossSeen.erase(it);
+			for (int c = 0; c < MAXPLAYERS; ++c) {
+				if (!players[c] || !players[c]->entity) continue;
+				if (Entity* f = mymod_remarkSpeaker(c, false, true)) {
+					char extra[192];
+					snprintf(extra, sizeof(extra), ",\"look\":\"%s\"",
+						mymod_jsonEscape(bname).c_str());
+					mymod_requestRemark(c, f, "bossdown", extra);
+					break;                        // one line for the party
+				}
+			}
+		}
 	}
 	if (scanClear) {
 		if (currentlevel != mymod_clearLevel) {
@@ -3131,6 +3251,11 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		mymod_floorHadEnemies = false;
 		mymod_floorCleared = false;
 		mymod_clearLevel = -1;
+		mymod_bossSeen.clear();
+		mymod_bossAnnounced.clear();
+		mymod_bossLevel = -1;
+		mymod_lastMapName.clear();
+		mymod_areaSeeded = false;
 		for (int t = 0; t < NUMMONSTERS; ++t) mymod_lastKills[t] = 0;
 		mymod_killsSeeded = false;
 		{ std::lock_guard<std::mutex> lk(mymod_traitsMutex); mymod_traits.clear(); }
