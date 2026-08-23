@@ -1633,6 +1633,48 @@ static Entity* mymod_deathSpeaker(int dead, int& outOwner) {
 	return other;
 }
 
+// ---- what the adventurer is wearing -----------------------------------------------------------
+// ⚠ Fired on a CHANGE of kit rather than on a timer: putting something on is a moment, and a
+// follower volunteering an opinion about your boots out of nowhere is not.
+static const struct { const char* slot; size_t off; } MYMOD_EQUIP_SLOTS[] = {
+	{"helm",        offsetof(Stat, helmet)},
+	{"body armour", offsetof(Stat, breastplate)},
+	{"gloves",      offsetof(Stat, gloves)},
+	{"boots",       offsetof(Stat, shoes)},
+	{"shield",      offsetof(Stat, shield)},
+	{"weapon",      offsetof(Stat, weapon)},
+	{"cloak",       offsetof(Stat, cloak)},
+	{"amulet",      offsetof(Stat, amulet)},
+	{"ring",        offsetof(Stat, ring)},
+	{"mask",        offsetof(Stat, mask)},
+};
+static const int MYMOD_EQUIP_COUNT = (int)(sizeof(MYMOD_EQUIP_SLOTS) / sizeof(MYMOD_EQUIP_SLOTS[0]));
+static const int MYMOD_EQUIP_CHANCE = 35;      // percent, on top of the shared cooldown
+static Uint32 mymod_lastEquip[MAXPLAYERS][MYMOD_EQUIP_COUNT] = {};
+static bool mymod_equipSeeded[MAXPLAYERS] = { false };
+
+static Item* mymod_equipAt(Stat* st, int i) {
+	if (!st || i < 0 || i >= MYMOD_EQUIP_COUNT) return nullptr;
+	return *(Item**)((char*)st + MYMOD_EQUIP_SLOTS[i].off);
+}
+
+// ---- what they are good and bad at ------------------------------------------------------------
+// ⚠ Sent as the game's own SKILL NAME and TIER, never a raw number. Barony's tiers are
+// NOVICE 1 / BASIC 20 / SKILLED 40 / EXPERT 60 / MASTER 80 / LEGENDARY 100 (stat.hpp:195), and
+// getSkillLangEntry gives the localized name, so none of it is invented here.
+static const int MYMOD_SKILL_CHANCE = 20;      // percent, once per floor
+static int mymod_skillLevel = -1;              // floor this was last offered on
+
+static const char* mymod_skillTier(int v) {
+	if (v >= SKILL_LEVEL_LEGENDARY) return "legendary";
+	if (v >= SKILL_LEVEL_MASTER)    return "a master";
+	if (v >= SKILL_LEVEL_EXPERT)    return "an expert";
+	if (v >= SKILL_LEVEL_SKILLED)   return "skilled";
+	if (v >= SKILL_LEVEL_BASIC)     return "competent";
+	if (v >= SKILL_LEVEL_NOVICE)    return "a novice";
+	return "hopeless";
+}
+
 // ---- major bosses ----------------------------------------------------------------------------
 // ⚠ Tracked as ENTITIES, not through kills[]. The tally only gives a race index, and a race is
 // not an identity here: LICH_ICE/LICH_FIRE are Erudyce and Orpheus only when spawned as the
@@ -1642,9 +1684,13 @@ static Entity* mymod_deathSpeaker(int dead, int& outOwner) {
 static bool mymod_isBossRace(Monster r) {
 	return r == LICH || r == DEVIL || r == LICH_FIRE || r == LICH_ICE;
 }
-static std::map<uint32_t, std::string> mymod_bossSeen;   // uid -> display name, while alive
+// ⚠ The minotaur rides the same entity tracking but is NOT a "major boss": it hunts you across
+// an ordinary floor rather than sitting at the end of one, and killing it is a different kind of
+// relief. Same machinery, different lines -- so the tracked value carries which it is.
+static std::map<uint32_t, std::pair<std::string, bool>> mymod_bossSeen;  // uid -> (name, isMino)
 static std::set<uint32_t> mymod_bossAnnounced;           // already shouted about, this floor
 static int mymod_bossLevel = -1;
+static bool mymod_minoTimerSeen = false;
 
 // ---- special and optional areas ---------------------------------------------------------------
 // ⚠ Keyed on the map's INTERNAL name, which is what the mod already sends. Several do not match
@@ -1799,6 +1845,62 @@ static void mymod_remarkTick() {
 			}
 		}
 
+		// --- a change of kit ---
+		{
+			int changed = -1;
+			for (int i = 0; i < MYMOD_EQUIP_COUNT; ++i) {
+				Item* it = mymod_equipAt(stats[pnum], i);
+				const Uint32 uid = it ? it->uid : 0;
+				if (uid != mymod_lastEquip[pnum][i]) {
+					mymod_lastEquip[pnum][i] = uid;
+					// Only remark on putting something ON, not on taking it off.
+					if (mymod_equipSeeded[pnum] && it && changed < 0) changed = i;
+				}
+			}
+			// ⚠ Seeded silently, or a new character's starting kit reads as ten things just
+			// put on -- the same trap the inventory watch has.
+			if (mymod_equipSeeded[pnum] && changed >= 0
+				&& local_rng.rand() % 100 < MYMOD_EQUIP_CHANCE) {
+				if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+					Item* it = mymod_equipAt(stats[pnum], changed);
+					char extra[224];
+					snprintf(extra, sizeof(extra), ",\"look\":\"%s\",\"slot\":\"%s\"",
+						mymod_jsonEscape(it ? items[it->type].getIdentifiedName() : "something").c_str(),
+						MYMOD_EQUIP_SLOTS[changed].slot);
+					mymod_requestRemark(pnum, f, "equip", extra);
+				}
+			}
+			mymod_equipSeeded[pnum] = true;
+		}
+
+		// --- what they are best and worst at, once per floor ---
+		if (mymod_skillLevel != currentlevel) {
+			mymod_skillLevel = currentlevel;
+			if (local_rng.rand() % 100 < MYMOD_SKILL_CHANCE) {
+				int hi = -1, lo = -1;
+				for (int k = 0; k < NUMPROFICIENCIES; ++k) {
+					const int v = stats[pnum]->getProficiency(k);
+					if (hi < 0 || v > stats[pnum]->getProficiency(hi)) hi = k;
+					if (lo < 0 || v < stats[pnum]->getProficiency(lo)) lo = k;
+				}
+				// ⚠ Needs a real strength to name. A fresh character is all zeroes, and
+				// "you are hopeless at everything" is not the line.
+				if (hi >= 0 && lo >= 0 && stats[pnum]->getProficiency(hi) >= SKILL_LEVEL_BASIC) {
+					if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+						char extra[320];
+						snprintf(extra, sizeof(extra),
+							",\"best\":\"%s\",\"besttier\":\"%s\","
+							"\"worst\":\"%s\",\"worsttier\":\"%s\"",
+							mymod_jsonEscape(getSkillLangEntry(hi)).c_str(),
+							mymod_skillTier(stats[pnum]->getProficiency(hi)),
+							mymod_jsonEscape(getSkillLangEntry(lo)).c_str(),
+							mymod_skillTier(stats[pnum]->getProficiency(lo)));
+						mymod_requestRemark(pnum, f, "skills", extra);
+					}
+				}
+			}
+		}
+
 		// --- swimming, or standing in lava ---
 		const int medium = mymod_swimMedium(pnum);
 		const bool swimming = (medium != 0) && (players[pnum]->movement.isPlayerSwimming()
@@ -1893,6 +1995,26 @@ static void mymod_remarkTick() {
 		mymod_bossLevel = currentlevel;
 		mymod_bossSeen.clear();
 		mymod_bossAnnounced.clear();
+		mymod_minoTimerSeen = false;
+	}
+
+	// --- the countdown starting ---
+	// ⚠ Only when the GUARD FAVOUR will not already speak. mymod_favourTick asks a trusted
+	// follower whether it heads the minotaur off, and that produces a line either way -- so
+	// firing here as well would double up on the first timer of a run. Once the guard is spent
+	// (once per run) the favour path goes quiet and this is the only voice left.
+	{
+		const bool timerNow = (mymod_findMinotaurTimer() != nullptr);
+		if (timerNow && !mymod_minoTimerSeen && mymod_minoGuardUsed) {
+			for (int c = 0; c < MAXPLAYERS; ++c) {
+				if (!players[c] || !players[c]->entity) continue;
+				if (Entity* f = mymod_remarkSpeaker(c, false, true)) {
+					mymod_requestRemark(c, f, "minotimer", "");
+					break;
+				}
+			}
+		}
+		mymod_minoTimerSeen = timerNow;
 	}
 
 	// --- trap arrows in flight, and whether the floor still has anything hostile on it ---
@@ -1920,12 +2042,13 @@ static void mymod_remarkTick() {
 		Stat* es = e->getStats();
 		if (!es || es->HP <= 0) continue;
 		// --- a major boss, alive and in the room ---
-		if (mymod_isBossRace(e->getRace())) {
+		const bool isMino = (e->getRace() == MINOTAUR);
+		if (mymod_isBossRace(e->getRace()) || isMino) {
 			const uint32_t buid = e->getUID();
 			const std::string bname = (es->name[0]
 				? std::string(es->name)
 				: getMonsterLocalizedName(e->getRace(), es));
-			mymod_bossSeen[buid] = bname;
+			mymod_bossSeen[buid] = std::make_pair(bname, isMino);
 			if (!mymod_bossAnnounced.count(buid)) {
 				for (int c = 0; c < MAXPLAYERS; ++c) {
 					if (!players[c] || !players[c]->entity) continue;
@@ -1938,7 +2061,7 @@ static void mymod_remarkTick() {
 						char extra[192];
 						snprintf(extra, sizeof(extra), ",\"look\":\"%s\"",
 							mymod_jsonEscape(bname).c_str());
-						mymod_requestRemark(c, f, "bossfight", extra);
+						mymod_requestRemark(c, f, isMino ? "minotaur" : "bossfight", extra);
 					}
 					break;
 				}
@@ -1985,7 +2108,8 @@ static void mymod_remarkTick() {
 			Entity* be = uidToEntity(it->first);
 			Stat* bs = be ? be->getStats() : nullptr;
 			if (be && bs && bs->HP > 0) { ++it; continue; }
-			const std::string bname = it->second;
+			const std::string bname = it->second.first;
+			const bool wasMino = it->second.second;
 			it = mymod_bossSeen.erase(it);
 			for (int c = 0; c < MAXPLAYERS; ++c) {
 				if (!players[c] || !players[c]->entity) continue;
@@ -1993,7 +2117,7 @@ static void mymod_remarkTick() {
 					char extra[192];
 					snprintf(extra, sizeof(extra), ",\"look\":\"%s\"",
 						mymod_jsonEscape(bname).c_str());
-					mymod_requestRemark(c, f, "bossdown", extra);
+					mymod_requestRemark(c, f, wasMino ? "minotaurdown" : "bossdown", extra);
 					break;                        // one line for the party
 				}
 			}
@@ -3243,6 +3367,8 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 			mymod_wasDrunk[c] = false;
 			mymod_hungerState[c] = MYMOD_HUNGER_NORMAL;
 			mymod_wasSwimming[c] = false;
+			mymod_equipSeeded[c] = false;
+			for (int i = 0; i < MYMOD_EQUIP_COUNT; ++i) mymod_lastEquip[c][i] = 0;
 			mymod_trapArrowNear[c] = 0;
 			mymod_hpSeeded[c] = false;
 		}
@@ -3254,7 +3380,9 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		mymod_bossSeen.clear();
 		mymod_bossAnnounced.clear();
 		mymod_bossLevel = -1;
+		mymod_minoTimerSeen = false;
 		mymod_lastMapName.clear();
+		mymod_skillLevel = -1;
 		mymod_areaSeeded = false;
 		for (int t = 0; t < NUMMONSTERS; ++t) mymod_lastKills[t] = 0;
 		mymod_killsSeeded = false;
