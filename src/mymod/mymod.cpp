@@ -47,6 +47,13 @@ static const uint32_t MYMOD_BABBLE_MIN_TICKS = 30 * 50;   // 30s
 static const uint32_t MYMOD_BABBLE_MAX_TICKS = 75 * 50;   // 75s
 static const int      MYMOD_BABBLE_FIRE_PCT  = 40;        // % chance to actually fire when timer elapses
 static const uint32_t MYMOD_TAUNT_COOLDOWN   = 20 * 50;   // 20s per-enemy
+// ⚠ THE PER-ENEMY COOLDOWN IS NOT A CADENCE. Each monster keeps its own 20s timer, so five
+// skeletons in one fight produce five taunts back to back and then five more twenty seconds
+// later. Measured in the first real session: 5.3 taunts a minute with gaps of 0.4s -- a wall of
+// text exactly when the player is busiest. The world channel needs a GLOBAL gap as well, the
+// same lesson the remark tiers learned.
+static const uint32_t MYMOD_WORLD_GAP        = 25 * 50;   // 25s between ANY two world lines
+static uint32_t mymod_lastWorldLine = 0;
 static const uint32_t MYMOD_FIGHT_COOLDOWN   = 45 * 50;   // 45s per-follower (anti-spam for shared fights)
 static const double   MYMOD_EARSHOT_SQ        = (10.0*16) * (10.0*16); // ~10 tiles, squared, in world units
 static const uint32_t MYMOD_CLIENT_SEND_COOLDOWN = 1 * 50;  // 1s between a client's sends (anti-flood only)
@@ -2876,6 +2883,9 @@ void mymod_ambientTick() {
 		}
 	}
 	if (mymod_convo[MYMOD_WORLD_SLOT].inflight.load()) return;   // one world line at a time
+	// ⚠ "One at a time" is NOT a cadence: a generation takes ~0.4s, so back-to-back speakers
+	// simply queue up. This is the actual spacing.
+	if (mymod_lastWorldLine != 0 && ticks - mymod_lastWorldLine < MYMOD_WORLD_GAP) return;
 	if (mymod_anyPlayerBusy()) return;                           // player dialogue has priority
 	if (!players[clientnum] || !players[clientnum]->entity) return;
 	if (intro || !map.entities) return;                          // not in a live level
@@ -2907,6 +2917,7 @@ void mymod_ambientTick() {
 	// TAUNT has priority.
 	if (tauntTarget) {
 		mymod_taunt_cooldowns[tauntTarget->getUID()] = ticks;
+		mymod_lastWorldLine = ticks;
 		std::string raceName = getMonsterLocalizedName(tauntTarget->getRace());
 		mymod_convo[MYMOD_WORLD_SLOT].prefix = "[taunt] ";
 		mymod_convo[MYMOD_WORLD_SLOT].speaker_uid = tauntTarget->getUID();
@@ -2933,6 +2944,7 @@ void mymod_ambientTick() {
 
 	std::string raceName = getMonsterLocalizedName(calmPick->getRace());
 	std::string relation = (mymod_ownerOf(calmPick) >= 0) ? "follower" : "hostile";
+	mymod_lastWorldLine = ticks;
 	mymod_convo[MYMOD_WORLD_SLOT].prefix = "[overheard] ";
 	mymod_convo[MYMOD_WORLD_SLOT].speaker_uid = calmPick->getUID();
 	char payload[512];
@@ -3790,7 +3802,16 @@ static void mymod_deliverSlot(int slot) {
 		snprintf(buf, sizeof(buf), "%s's %s: ", owner, who.empty() ? "follower" : who.c_str());
 		prefix = buf;
 	}
-	mymod_broadcastLine(cv.speaker_uid, prefix, reply);
+	// ⚠ A TAUNT IS A BUBBLE, NOT A CHAT LINE. The shared feed is where the actual conversation
+	// lives, and monster taunts push it off the screen during exactly the fight the player is
+	// trying to read. Same call the dummybot heckler already makes, and for the same reason --
+	// the line still appears over the monster's head, which is where the player is looking.
+	// Ambient babble keeps its chat line: it is rare (0.3/min measured) and it is scene-setting.
+	if (isWorld && cv.prefix == "[taunt] ") {
+		mymod_broadcastBubble(cv.speaker_uid, reply);
+	} else {
+		mymod_broadcastLine(cv.speaker_uid, prefix, reply);
+	}
 	// The figure follows his words: he names his terms, then the engine states the number.
 	// He is forbidden from saying one himself, so without this the price is never quoted.
 	if (!quote.empty()) {
