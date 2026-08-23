@@ -172,10 +172,18 @@ static bool mymod_isEmplacement(Entity* e) {
 // A follower whose Stat->name the engine reads back as identity. Renaming one of these is
 // not cosmetic: nameMatchesSpecialNPCName (monster_shared.cpp:569) compares Stat->name
 // directly, so an AI-chosen name makes a skeleton knight stop being one.
+static const int MYMOD_RAT_SLAYER = 21;   // MISC_FLAGS index; see the rat easter egg
+
 static bool mymod_nameIsLoadBearing(Entity* e) {
 	if (!e) return false;
 	Stat* s = e->getStats();
-	return s && !s->getAttribute("special_npc").empty();
+	if (!s) return false;
+	// ⚠ The rat that killed the Baron keeps the name it had when it did. Follower state is
+	// uid-keyed service-side and a level change gives the creature a NEW uid, so the service
+	// would otherwise decide it is unnamed and reveal a second name on a later floor -- and the
+	// legend the twins have heard about would quietly become somebody else.
+	if (s->MISC_FLAGS[MYMOD_RAT_SLAYER] != 0) return true;
+	return !s->getAttribute("special_npc").empty();
 }
 
 struct MymodFollowerWatch {
@@ -1822,9 +1830,8 @@ static const double MYMOD_RATFEAR_RANGE = 12 * 16;
 // new entities on every level load (game.cpp:2455 copies their stats onto a fresh monster), so a
 // uid does not survive a staircase -- but Stat::copyStats() copies all 32 MISC_FLAGS and the
 // name (stat.cpp:641/679), so a flag set here rides down fifteen floors with the creature.
-// Indices 1-15 and 17-20 are spoken for; 21 is free.
-static const int MYMOD_RAT_SLAYER = 21;
-
+// Indices 1-15 and 17-20 are spoken for; 21 is free (declared up by mymod_nameIsLoadBearing,
+// which has to know about it too).
 static bool mymod_isRatSlayer(Entity* e) {
 	Stat* s = e ? e->getStats() : nullptr;
 	return s && s->MISC_FLAGS[MYMOD_RAT_SLAYER] != 0;
@@ -1834,6 +1841,8 @@ static bool   mymod_ratfearArmed = false;        // line requested, kill pending
 static int    mymod_ratfearPlayer = -1;
 static Uint32 mymod_ratfearKillAt = 0;
 static bool   mymod_ratfearTwins = false;
+static uint32_t mymod_ratfearRatUID = 0;    // the rat itself, for the naming below
+static std::string mymod_ratfearNewName;    // a name the service gave it for this
 
 // A rat this player brought all the way down here, still alive and close to the boss.
 // ⚠ Prefers the SLAYER if one is present, because that rat does not roll -- it simply wins.
@@ -2519,6 +2528,11 @@ static void mymod_remarkTick() {
 						if (Stat* rs2 = rat->getStats()) {
 							if (rs2->name[0]) ratName = rs2->name;
 						}
+						// ⚠ A rat that kills the Baron has earned a name. If it has not got one
+						// yet the service picks one from the pool and the engine writes it here,
+						// so the legend the twins hear about is a named creature.
+						mymod_ratfearRatUID = rat->getUID();
+						mymod_ratfearNewName.clear();
 						// ⚠ Fired as an NPC so deliverSlot takes the non-follower branch: a
 						// bubble and a chat line, and none of the boons, renaming or ALLY_CMD
 						// machinery that a follower reply drags along.
@@ -2526,12 +2540,13 @@ static void mymod_remarkTick() {
 						snprintf(payload, sizeof(payload),
 							"{\"ratfear\":true,\"race\":\"%s\",\"floor\":%d,\"map\":\"%s\","
 							"\"player\":%d,\"boss\":\"%s\",\"legend\":%s,"
-							"\"ratname\":\"%s\"}",
+							"\"ratname\":\"%s\",\"ratunnamed\":%s}",
 							mymod_jsonEscape(getMonsterLocalizedName(e->getRace(), es)).c_str(),
 							currentlevel, mymod_jsonEscape(map.name).c_str(), owner,
 							mymod_jsonEscape(bname).c_str(),
 							legend ? "true" : "false",
-							mymod_jsonEscape(ratName).c_str());
+							mymod_jsonEscape(ratName).c_str(),
+							ratName[0] ? "false" : "true");
 						mymod_fireRequest(owner, payload, buid, true, "the Baron (rat)");
 						mymod_log("ratfear: TRIGGERED on %s by p%d's %srat%s%s", bname.c_str(),
 							owner, legend ? "LEGENDARY " : "",
@@ -2602,6 +2617,21 @@ static void mymod_remarkTick() {
 				mymod_ratfearKillAt = ticks + 75;      // ~1.5s
 			}
 		} else if (ticks >= mymod_ratfearKillAt) {
+			// ⚠ Name it BEFORE the boss falls, so the creature that gets talked about already
+			// has the name. mymod_nameIsLoadBearing then refuses to ever rename it.
+			if (!mymod_ratfearNewName.empty() && mymod_ratfearRatUID != 0) {
+				if (Entity* rat = uidToEntity(mymod_ratfearRatUID)) {
+					if (Stat* rs = rat->getStats()) {
+						strncpy(rs->name, mymod_ratfearNewName.c_str(), 127);
+						rs->name[127] = '\0';
+						mymod_netBroadcastName(mymod_ratfearRatUID, mymod_ratfearNewName);
+						mymod_log("ratfear: the rat is now called %s",
+							mymod_ratfearNewName.c_str());
+					}
+				}
+			}
+			mymod_ratfearNewName.clear();
+			mymod_ratfearRatUID = 0;
 			mymod_ratfearKill();
 			mymod_ratfearArmed = false;
 			mymod_ratfearPlayer = -1;
@@ -3060,6 +3090,11 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 		std::string fav    = mymod_jsonField(body, "favour");
 		std::string quo    = mymod_jsonField(body, "quote");
 		std::string hnt    = mymod_jsonField(body, "hint");
+		// The rat easter egg: a name the service just gave the creature that killed the Baron.
+		{
+			std::string rn = mymod_jsonField(body, "ratname");
+			if (!rn.empty()) mymod_ratfearNewName = rn;
+		}
 		if (action.empty()) action = "NONE";
 		if (ident.empty())  ident = "0";
 		mymod_trimTail(speech);
