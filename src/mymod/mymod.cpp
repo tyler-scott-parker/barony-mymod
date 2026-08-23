@@ -1496,6 +1496,9 @@ static Entity* mymod_remarkSpeaker(int pnum, bool urgent) {
 // ⚠ Deliberately NOT every chest. They are common enough that a line each time becomes wallpaper,
 // and the whole design rule here is scarcity (spec 35/36).
 static const int MYMOD_CHEST_CHANCE = 35;          // percent, on top of the shared cooldown
+// ⚠ Rare on purpose: bread and apples are picked up constantly, and a line every time would
+// bury everything else the follower says.
+static const int MYMOD_FOOD_CHANCE = 12;          // percent, on top of the shared cooldown
 static bool mymod_chestWasOpen[MAXPLAYERS] = { false };
 
 // ---- the player is drunk -------------------------------------------------------------------
@@ -1555,6 +1558,29 @@ static int mymod_hungerStateOf(int pnum) {
 	return MYMOD_HUNGER_NORMAL;
 }
 
+// ---- swimming ------------------------------------------------------------------------------
+static bool mymod_wasSwimming[MAXPLAYERS] = { false };
+
+// ---- floor cleared --------------------------------------------------------------------------
+// ⚠ Barony has NO concept of a cleared floor -- there is no flag, no message and no counter, so
+// it has to be derived: hostiles present, then none. Judged with the player's own checkEnemy
+// rather than by counting actMonster, which would call Hamlet's townsfolk and your own
+// followers "hostile" and mean the town could never be clear.
+static bool mymod_floorHadEnemies = false;
+static bool mymod_floorCleared = false;
+static int  mymod_clearLevel = -1;
+static Uint32 mymod_nextClearScan = 0;
+
+// ---- arrow traps ----------------------------------------------------------------------------
+// ⚠ Detected WITHOUT an upstream hook, which is why it is indirect. An arrow fired by a trap
+// carries the trap's uid in `parent` (actarrowtrap.cpp:238), so each frame we note when such an
+// arrow is close to a player; if that player's HP then drops within a few frames, the trap is
+// what did it. Hooking the damage path would mean adding entity.cpp to the upstream diff, and
+// this is a flavour line.
+static Uint32 mymod_trapArrowNear[MAXPLAYERS] = { 0 };
+static int    mymod_lastHP[MAXPLAYERS] = { 0 };
+static bool   mymod_hpSeeded[MAXPLAYERS] = { false };
+
 // ---- a chest that was a monster --------------------------------------------------------------
 // ⚠ A mimic is NOT a chest that transforms -- map generation REPLACES a chest with a MIMIC
 // monster entity at the chest's position (maps.cpp:10893), so it never touches openedChest and
@@ -1571,6 +1597,7 @@ static void mymod_valuablesTick() {
 		const bool seeded = mymod_seenSeeded[pnum];
 		Item* found = nullptr;
 		int bestValue = 0;
+		Item* foundFood = nullptr;
 		for (node_t* n = stats[pnum]->inventory.first; n != NULL; n = n->next) {
 			Item* it = (Item*)n->element;
 			if (!it) continue;
@@ -1581,11 +1608,28 @@ static void mymod_valuablesTick() {
 			// player only finds out by having it appraised.
 			const int v = it->identified ? it->getGoldValue() : mymod_appraisalValue(it);
 			if (v > bestValue) { bestValue = v; found = it; }
+			// ⚠ Food is worth almost nothing, so it never wins the value contest above and
+			// needs its own slot. Rarely, though -- bread is picked up constantly.
+			if (items[it->type].category == FOOD && !foundFood
+				&& local_rng.rand() % 100 < MYMOD_FOOD_CHANCE) {
+				foundFood = it;
+			}
 		}
 		mymod_seenSeeded[pnum] = true;
-		if (!found || bestValue < MYMOD_VALUABLE_MIN) continue;
-		if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
-			mymod_requestValuable(pnum, f, found, bestValue);
+		// The valuable find wins the turn if there is one; food is the consolation.
+		if (found && bestValue >= MYMOD_VALUABLE_MIN) {
+			if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+				mymod_requestValuable(pnum, f, found, bestValue);
+			}
+			continue;
+		}
+		if (foundFood) {
+			if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+				char extra[160];
+				snprintf(extra, sizeof(extra), ",\"look\":\"%s\"",
+					mymod_jsonEscape(items[foundFood->type].getIdentifiedName()).c_str());
+				mymod_requestRemark(pnum, f, "food", extra);
+			}
 		}
 	}
 }
@@ -1630,6 +1674,31 @@ static void mymod_remarkTick() {
 			}
 		}
 
+		// --- swimming ---
+		const bool swimming = (players[pnum]->movement.isPlayerSwimming()
+			|| (players[pnum]->entity && players[pnum]->entity->skill[13] != 0));
+		if (swimming && !mymod_wasSwimming[pnum]) {
+			if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+				mymod_requestRemark(pnum, f, "swimming", "");
+			}
+		}
+		mymod_wasSwimming[pnum] = swimming;
+
+		// --- shot by an arrow trap ---
+		// HP is compared against the previous frame; a drop within a few frames of a
+		// trap-fired arrow being close is the trap landing one.
+		const int hp = stats[pnum]->HP;
+		if (mymod_hpSeeded[pnum] && hp < mymod_lastHP[pnum] && hp > 0
+			&& mymod_trapArrowNear[pnum] != 0
+			&& ticks - mymod_trapArrowNear[pnum] <= 6) {
+			mymod_trapArrowNear[pnum] = 0;      // one line per volley, not per arrow
+			if (Entity* f = mymod_remarkSpeaker(pnum, true)) {
+				mymod_requestRemark(pnum, f, "arrowtrap", "");
+			}
+		}
+		mymod_lastHP[pnum] = hp;
+		mymod_hpSeeded[pnum] = true;
+
 		// --- drunk ---
 		const bool drunk = stats[pnum]->getEffectActive(EFF_DRUNK);
 		if (drunk && !mymod_wasDrunk[pnum]) {
@@ -1640,8 +1709,60 @@ static void mymod_remarkTick() {
 		mymod_wasDrunk[pnum] = drunk;
 	}
 
-	// --- a mimic waking up ---
 	if (!map.entities) return;
+
+	// --- trap arrows in flight, and whether the floor still has anything hostile on it ---
+	const bool scanClear = (ticks >= mymod_nextClearScan);
+	if (scanClear) mymod_nextClearScan = ticks + 50;    // once a second is plenty
+	int hostiles = 0;
+	for (node_t* nd = map.entities->first; nd != NULL; nd = nd->next) {
+		Entity* e = (Entity*)nd->element;
+		if (!e) continue;
+		if (e->behavior == &actArrow && e->parent != 0) {
+			Entity* src = uidToEntity(e->parent);
+			if (src && src->behavior == &actArrowTrap) {
+				for (int c = 0; c < MAXPLAYERS; ++c) {
+					if (!players[c] || !players[c]->entity) continue;
+					const double dx = e->x - players[c]->entity->x;
+					const double dy = e->y - players[c]->entity->y;
+					if (dx * dx + dy * dy < (double)(3 * 16) * (3 * 16)) {
+						mymod_trapArrowNear[c] = ticks;
+					}
+				}
+			}
+			continue;
+		}
+		if (!scanClear || e->behavior != &actMonster) continue;
+		Stat* es = e->getStats();
+		if (!es || es->HP <= 0) continue;
+		// checkEnemy against a real player: honours everybodyfriendly, followers and townsfolk.
+		for (int c = 0; c < MAXPLAYERS; ++c) {
+			if (!players[c] || !players[c]->entity) continue;
+			if (players[c]->entity->checkEnemy(e)) { ++hostiles; break; }
+		}
+	}
+	if (scanClear) {
+		if (currentlevel != mymod_clearLevel) {
+			mymod_clearLevel = currentlevel;
+			mymod_floorHadEnemies = false;
+			mymod_floorCleared = false;
+		}
+		if (hostiles > 0) mymod_floorHadEnemies = true;
+		// ⚠ Needs to have HAD enemies. A floor you walk onto empty was never cleared, and the
+		// town is not a victory.
+		if (hostiles == 0 && mymod_floorHadEnemies && !mymod_floorCleared) {
+			mymod_floorCleared = true;
+			for (int c = 0; c < MAXPLAYERS; ++c) {
+				if (!players[c] || !players[c]->entity) continue;
+				if (Entity* f = mymod_remarkSpeaker(c, false)) {
+					mymod_requestRemark(c, f, "cleared", "");
+					break;                       // one line for the party, not one each
+				}
+			}
+		}
+	}
+
+	// --- a mimic waking up ---
 	for (node_t* nd = map.entities->first; nd != NULL; nd = nd->next) {
 		Entity* e = (Entity*)nd->element;
 		if (!e || e->behavior != &actMonster) continue;
@@ -2863,9 +2984,15 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 			mymod_chestWasOpen[c] = false;
 			mymod_wasDrunk[c] = false;
 			mymod_hungerState[c] = MYMOD_HUNGER_NORMAL;
+			mymod_wasSwimming[c] = false;
+			mymod_trapArrowNear[c] = 0;
+			mymod_hpSeeded[c] = false;
 		}
 		mymod_lastValuableTick = 0;
 		mymod_seenMimics.clear();
+		mymod_floorHadEnemies = false;
+		mymod_floorCleared = false;
+		mymod_clearLevel = -1;
 		{ std::lock_guard<std::mutex> lk(mymod_traitsMutex); mymod_traits.clear(); }
 		mymod_watchLevel = -1;
 	}
