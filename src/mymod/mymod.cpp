@@ -1658,6 +1658,26 @@ static Item* mymod_equipAt(Stat* st, int i) {
 	return *(Item**)((char*)st + MYMOD_EQUIP_SLOTS[i].off);
 }
 
+// ⚠ An artifact is not just another helm. Reusing the appraisal ceiling rather than listing
+// ARTIFACT_* keeps one definition of "legendary" in the mod: everything over 1500 gold, which is
+// the tier the game itself reserves for a near-master appraiser (data/appraisal_tables.json).
+static const int MYMOD_LEGENDARY_VALUE = 1500;
+
+// ---- gear handed to a FOLLOWER -----------------------------------------------------------------
+// ⚠ Watched, not hooked. A player can arm a follower through the follower inventory, by dropping
+// something for them, or by the ally command path -- watching the slots catches all of it and
+// adds nothing to the upstream diff.
+static std::map<uint32_t, std::vector<Uint32>> mymod_followerKit;   // uid -> item uid per slot
+
+// ---- rich and poor -----------------------------------------------------------------------------
+// ⚠ Bands, edge-triggered, like hunger. Calibrated against the economy the appraisal work
+// measured: starting gold is 0-250 for most classes, a floor pile is ~60+floor, and a shop sword
+// runs 480 at PRO_TRADING 0 -- so under 25 is genuinely stuck and over 2000 is a war chest.
+static const int MYMOD_GOLD_POOR = 25;
+static const int MYMOD_GOLD_RICH = 2000;
+static int mymod_goldBand[MAXPLAYERS] = { 0 };      // -1 poor, 0 ordinary, 1 rich
+static bool mymod_goldSeeded[MAXPLAYERS] = { false };
+
 // ---- what they are good and bad at ------------------------------------------------------------
 // ⚠ Sent as the game's own SKILL NAME and TIER, never a raw number. Barony's tiers are
 // NOVICE 1 / BASIC 20 / SKILLED 40 / EXPERT 60 / MASTER 80 / LEGENDARY 100 (stat.hpp:195), and
@@ -1863,14 +1883,18 @@ static void mymod_remarkTick() {
 			}
 			// ⚠ Seeded silently, or a new character's starting kit reads as ten things just
 			// put on -- the same trap the inventory watch has.
+			// ⚠ A legendary piece always gets a line. Putting on an artifact is not the sort
+			// of thing a companion notices only a third of the time.
+			Item* newIt = (changed >= 0) ? mymod_equipAt(stats[pnum], changed) : nullptr;
+			const bool legendary = newIt && mymod_appraisalValue(newIt) > MYMOD_LEGENDARY_VALUE;
 			if (mymod_equipSeeded[pnum] && changed >= 0
-				&& local_rng.rand() % 100 < MYMOD_EQUIP_CHANCE) {
+				&& (legendary || local_rng.rand() % 100 < MYMOD_EQUIP_CHANCE)) {
 				if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
-					Item* it = mymod_equipAt(stats[pnum], changed);
-					char extra[224];
-					snprintf(extra, sizeof(extra), ",\"look\":\"%s\",\"slot\":\"%s\"",
-						mymod_jsonEscape(it ? items[it->type].getIdentifiedName() : "something").c_str(),
-						MYMOD_EQUIP_SLOTS[changed].slot);
+					char extra[256];
+					snprintf(extra, sizeof(extra),
+						",\"look\":\"%s\",\"slot\":\"%s\",\"legendary\":%s",
+						mymod_jsonEscape(newIt ? items[newIt->type].getIdentifiedName() : "something").c_str(),
+						MYMOD_EQUIP_SLOTS[changed].slot, legendary ? "true" : "false");
 					mymod_requestRemark(pnum, f, "equip", extra);
 				}
 			}
@@ -1914,6 +1938,22 @@ static void mymod_remarkTick() {
 					}
 				}
 			}
+		}
+
+		// --- rich or destitute ---
+		{
+			const int g = (int)stats[pnum]->GOLD;
+			const int band = (g <= MYMOD_GOLD_POOR) ? -1 : (g >= MYMOD_GOLD_RICH ? 1 : 0);
+			if (mymod_goldSeeded[pnum] && band != mymod_goldBand[pnum] && band != 0) {
+				if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+					char extra[64];
+					snprintf(extra, sizeof(extra), ",\"band\":\"%s\"",
+						band < 0 ? "poor" : "rich");
+					mymod_requestRemark(pnum, f, "wealth", extra);
+				}
+			}
+			mymod_goldBand[pnum] = band;
+			mymod_goldSeeded[pnum] = true;
 		}
 
 		// --- swimming, or standing in lava ---
@@ -2056,6 +2096,43 @@ static void mymod_remarkTick() {
 		if (!scanClear || e->behavior != &actMonster) continue;
 		Stat* es = e->getStats();
 		if (!es || es->HP <= 0) continue;
+		// --- something handed to a follower ---
+		// ⚠ Watched rather than hooked: a player can arm a follower through the follower
+		// inventory, by dropping something for them, or through the ally command path, and
+		// watching the slots catches all of it.
+		{
+			const int fowner = mymod_ownerOf(e);
+			if (fowner >= 0) {
+				const uint32_t fuid = e->getUID();
+				auto kit = mymod_followerKit.find(fuid);
+				const bool known = (kit != mymod_followerKit.end());
+				if (!known) mymod_followerKit[fuid] = std::vector<Uint32>(MYMOD_EQUIP_COUNT, 0);
+				std::vector<Uint32>& slots = mymod_followerKit[fuid];
+				int got = -1;
+				for (int i = 0; i < MYMOD_EQUIP_COUNT; ++i) {
+					Item* fit = mymod_equipAt(es, i);
+					const Uint32 iu = fit ? fit->uid : 0;
+					if (iu != slots[i]) {
+						slots[i] = iu;
+						// ⚠ Seeded silently on first sight, or a recruit's own gear reads as a
+						// gift -- most dungeon creatures come armed.
+						if (known && fit && got < 0) got = i;
+					}
+				}
+				if (got >= 0) {
+					if (Entity* sp = mymod_remarkSpeaker(fowner, false)) {
+						// The one who was armed does the talking if it can.
+						Entity* voice = (sp == e) ? sp : e;
+						Item* fit = mymod_equipAt(es, got);
+						char extra[256];
+						snprintf(extra, sizeof(extra), ",\"look\":\"%s\",\"slot\":\"%s\"",
+							mymod_jsonEscape(fit ? items[fit->type].getIdentifiedName() : "something").c_str(),
+							MYMOD_EQUIP_SLOTS[got].slot);
+						mymod_requestRemark(fowner, voice, "gift", extra);
+					}
+				}
+			}
+		}
 		// --- a major boss, alive and in the room ---
 		const bool isMino = (e->getRace() == MINOTAUR);
 		if (mymod_isBossRace(e->getRace()) || isMino) {
@@ -2614,14 +2691,29 @@ static std::string mymod_payloadHead(int pnum, const std::string& raceName, uint
 	// whether it is enough -- the model cannot check a balance, so affordability is resolved
 	// server-side like every other condition in this project.
 	const int purse = (stats[pnum]) ? (int)stats[pnum]->GOLD : 0;
+	// ⚠ WHAT the adventurer is. Barony's DLC makes skeletons, goblins, rats, trolls and the rest
+	// playable, and a goblin taking orders from a goblin is not the same conversation as a goblin
+	// taking orders from a human. Sent as the localized race name so the service needs no second
+	// table; empty for a plain human, so ordinary play is unchanged.
+	//
+	// ⚠ NAMED player_kind, NOT player_race, AND THE DIFFERENCE MATTERS. `player_race` is already
+	// taken: it is the SHAPESHIFT form and it feeds can_understand(), the comprehension filter.
+	// Putting the chosen race in that field would mean a vampire, succubus or incubus player --
+	// none of which are in a comprehension group -- suddenly understands nobody, which is the
+	// exact bug the polymorph work exists to avoid. Two fields, two meanings.
+	std::string playerRace;
+	if (stats[pnum] && stats[pnum]->type != HUMAN && stats[pnum]->type != NOTHING) {
+		playerRace = getMonsterLocalizedName(stats[pnum]->type);
+	}
 	snprintf(buf, sizeof(buf),
 		"\"race\":\"%s\",\"floor\":%d,\"map\":\"%s\",\"says\":\"%s\",\"uid\":%u,"
 		"\"player\":%d,\"player_name\":\"%s\",\"origin\":\"%s\",\"origin_key\":\"%s\","
-		"\"gold\":%d",
+		"\"gold\":%d,\"player_kind\":\"%s\"",
 		raceName.c_str(), currentlevel, mymod_jsonEscape(map.name).c_str(),
 		mymod_jsonEscape(says).c_str(), (unsigned)uid,
 		pnum, mymod_jsonEscape(playerName).c_str(),
-		origin, mymod_jsonEscape(originKey).c_str(), purse);
+		origin, mymod_jsonEscape(originKey).c_str(), purse,
+		mymod_jsonEscape(playerRace).c_str());
 	return std::string(buf);
 }
 
@@ -3383,6 +3475,8 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 			mymod_hungerState[c] = MYMOD_HUNGER_NORMAL;
 			mymod_wasSwimming[c] = false;
 			mymod_equipSeeded[c] = false;
+			mymod_goldSeeded[c] = false;
+			mymod_goldBand[c] = 0;
 			for (int i = 0; i < MYMOD_EQUIP_COUNT; ++i) mymod_lastEquip[c][i] = 0;
 			mymod_trapArrowNear[c] = 0;
 			mymod_hpSeeded[c] = false;
@@ -3398,6 +3492,7 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		mymod_minoTimerSeen = false;
 		mymod_lastMapName.clear();
 		mymod_skillLevel = -1;
+		mymod_followerKit.clear();
 		mymod_areaSeeded = false;
 		for (int t = 0; t < NUMMONSTERS; ++t) mymod_lastKills[t] = 0;
 		mymod_killsSeeded = false;
