@@ -65,6 +65,7 @@ struct MymodConvo {
 	int         charge = 0;     // the mercenary's fee, in gold, pending deduction
 	std::string favour;         // a job he was just hired for, for the engine to perform
 	std::string quote;          // "kind:price" the engine should print
+	std::string hint;           // "1" when the engine should print the command hints
 	std::string haggle;         // "<shopkeeper uid>:<percent>" from a merchant negotiation
 	std::string sabotage;       // "minotaur" -- a spy spending the player's floor against them
 	std::string prefix;         // chat-line label, e.g. "[taunt] " or "Ada's Grix: "
@@ -743,6 +744,20 @@ static void mymod_chargeGold(int pnum, int amount) {
 	messagePlayerColor(pnum, MESSAGE_INVENTORY, makeColorRGB(255, 216, 102),
 		"You hand over %d gold.", amount);
 	mymod_log("merc: charged p%d %d gold (%d left)", pnum, amount, (int)stats[pnum]->GOLD);
+}
+
+// The command hints, printed ONCE per run, the first time a follower introduces itself.
+//
+// ⚠ Same split as the price figures: the follower says in character what it is willing to do,
+// and the ENGINE names the commands. The model must never be asked to recite "/aicommand" --
+// it is not diegetic, it would be got wrong, and the engine already knows it for certain.
+// Two lines, once, and never again: this is a nudge, not a tutorial.
+static void mymod_printHints(int pnum) {
+	messagePlayerColor(pnum, MESSAGE_HINT, makeColorRGB(150, 210, 255),
+		"(Talk to them with /aicommand <what you want to say>, or hold V to speak aloud.)");
+	messagePlayerColor(pnum, MESSAGE_HINT, makeColorRGB(150, 210, 255),
+		"(/aiidentify has a companion appraise an unidentified item. They do it for someone "
+		"they trust — or for coin.)");
 }
 
 // ⚠ The ENGINE prints the figure, never the model. Measured in the haggle work: asked to quote
@@ -1814,6 +1829,7 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 		std::string chg    = mymod_jsonField(body, "charge");
 		std::string fav    = mymod_jsonField(body, "favour");
 		std::string quo    = mymod_jsonField(body, "quote");
+		std::string hnt    = mymod_jsonField(body, "hint");
 		if (action.empty()) action = "NONE";
 		if (ident.empty())  ident = "0";
 		mymod_trimTail(speech);
@@ -1841,7 +1857,7 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 			std::lock_guard<std::mutex> lock(c.mutex);
 			c.reply = speech; c.action = action; c.name = gname; c.boon = boon; c.haggle = hag;
 			c.sabotage = sab;
-			c.charge = atoi(chg.c_str()); c.favour = fav; c.quote = quo;
+			c.charge = atoi(chg.c_str()); c.favour = fav; c.quote = quo; c.hint = hnt;
 		}
 		c.ready.store(true);
 	}).detach();
@@ -2287,13 +2303,13 @@ static void mymod_broadcastLine(uint32_t speakerUID, const std::string& prefix, 
 static void mymod_deliverSlot(int slot) {
 	MymodConvo& cv = mymod_convo[slot];
 	if (!cv.ready.load()) return;
-	std::string reply, action, gname, boon, haggle, sabotage, favour, quote;
+	std::string reply, action, gname, boon, haggle, sabotage, favour, quote, hint;
 	int charge = 0;
 	{
 		std::lock_guard<std::mutex> lock(cv.mutex);
 		reply = cv.reply; action = cv.action; gname = cv.name; boon = cv.boon; haggle = cv.haggle;
 		sabotage = cv.sabotage;
-		charge = cv.charge; favour = cv.favour; quote = cv.quote;
+		charge = cv.charge; favour = cv.favour; quote = cv.quote; hint = cv.hint;
 	}
 	// Applied on the main thread, before the line is spoken: the tell should land at the same
 	// moment the clock starts, not after it.
@@ -2330,6 +2346,7 @@ static void mymod_deliverSlot(int slot) {
 	cv.name.clear();
 	cv.boon.clear();
 	cv.quote.clear();
+	cv.hint.clear();
 
 	const bool isWorld = (slot == MYMOD_WORLD_SLOT);
 	const int pnum = isWorld ? clientnum : slot;
@@ -2433,6 +2450,9 @@ static void mymod_deliverSlot(int slot) {
 		Stat* qs = follower ? follower->getStats() : nullptr;
 		mymod_printQuote(pnum, quote, (qs && qs->name[0]) ? qs->name : "");
 	}
+	// After their line, so it reads as a footnote to what they just offered rather than as a
+	// banner in front of it.
+	if (hint == "1") mymod_printHints(pnum);
 	cv.prefix.clear();
 	cv.speaker_uid = 0;
 
