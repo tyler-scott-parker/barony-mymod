@@ -1450,9 +1450,64 @@ static void mymod_heckleTick() {
 	}
 }
 
+// ---- "That looks worth something" -------------------------------------------------------
+// A follower remarks when you pick up something valuable.
+//
+// ⚠ NO UPSTREAM HOOK. itemPickup() is called from a dozen contexts (shop purchases, stack
+// splits, emptying bottles) and hooking it would mean a new file in the upstream diff for a
+// cosmetic feature. Instead this rides the per-frame scan that mymod_watch already runs, the
+// same way fight-survival does: watch each player's inventory for a uid that was not there
+// last frame. Cheap -- a few dozen items per player -- and it catches every route into the
+// inventory, including ones itemPickup does not cover.
+static Entity* mymod_findFollower(int pnum);                    // defined below
+int mymod_appraisalValue(Item* it);                            // mirrors appraisalPossible
+static void mymod_requestValuable(int pnum, Entity* f, Item* it, int value);
+
+static std::set<Uint32> mymod_seenItems[MAXPLAYERS];
+static bool  mymod_seenSeeded[MAXPLAYERS] = { false };
+static Uint32 mymod_lastValuableTick = 0;
+
+// ⚠ Seeded silently on the first pass, or a Merchant's 1000 starting gold worth of kit would
+// all read as "just picked up" the instant the run began.
+static const int MYMOD_VALUABLE_MIN = 1000;      // aquamarine and up; see the appraisal tiers
+static const Uint32 MYMOD_VALUABLE_COOLDOWN = 20 * 50;   // gems come in bunches; 20s apart
+
+static void mymod_valuablesTick() {
+	if (intro) return;
+	for (int pnum = 0; pnum < MAXPLAYERS; ++pnum) {
+		if (!stats[pnum] || (!players[pnum] || !players[pnum]->entity)) continue;
+		std::set<Uint32>& seen = mymod_seenItems[pnum];
+		const bool seeded = mymod_seenSeeded[pnum];
+		Item* found = nullptr;
+		int bestValue = 0;
+		for (node_t* n = stats[pnum]->inventory.first; n != NULL; n = n->next) {
+			Item* it = (Item*)n->element;
+			if (!it) continue;
+			if (!seen.insert(it->uid).second) continue;      // already known
+			if (!seeded) continue;                            // first pass: learn, do not speak
+			// An UNidentified item is judged the way the appraisal system judges it, which is
+			// what makes a glass gem read as treasure -- exactly Barony's own joke, and the
+			// player only finds out by having it appraised.
+			const int v = it->identified ? it->getGoldValue() : mymod_appraisalValue(it);
+			if (v > bestValue) { bestValue = v; found = it; }
+		}
+		mymod_seenSeeded[pnum] = true;
+		if (!found || bestValue < MYMOD_VALUABLE_MIN) continue;
+		if (ticks - mymod_lastValuableTick < MYMOD_VALUABLE_COOLDOWN) continue;
+		if (mymod_convo[pnum].inflight.load() || mymod_anyPlayerBusy()) continue;
+		Entity* f = mymod_findFollower(pnum);
+		if (!f) continue;
+		Stat* fs = f->getStats();
+		if (!fs || fs->HP <= 0) continue;
+		mymod_lastValuableTick = ticks;
+		mymod_requestValuable(pnum, f, found, bestValue);
+	}
+}
+
 void mymod_ambientTick() {
 	if (!mymod_isHost()) return;
 	mymod_heckleTick();
+	mymod_valuablesTick();
 	// Fight-survival scan: runs first so combat is tracked every frame, even during
 	// conversations. Covers EVERY player's followers, not just the host's.
 	if (!intro && map.entities) {
@@ -1907,7 +1962,7 @@ static Uint32 mymod_identItem[MAXPLAYERS] = { 0 };   // item awaiting a verdict,
 // to be hard to tell from a real one, and skipping that would let a follower spot the joke for
 // free. Passing this to the service is what lets a follower's competence be expressed in the
 // game's own currency instead of an invented blocklist.
-static int mymod_appraisalValue(Item* it) {
+int mymod_appraisalValue(Item* it) {
 	if (!it) return 0;
 	return (it->type == GEM_GLASS) ? 1000 : it->getGoldValue();
 }
@@ -1967,6 +2022,30 @@ static void mymod_identifyFire(int pnum, Entity* follower, Uint32 itemUid, const
 	std::string payload = "{" + mymod_payloadHead(pnum, raceName, follower->getUID(),
 		"what is this? can you tell me what I'm carrying?") + tail + "}";
 	mymod_fireRequest(pnum, payload, follower->getUID(), false, raceName.c_str());
+}
+
+// HOST: a follower remarks on something valuable the player just picked up.
+//
+// ⚠ It sends the LOOK of the thing, never what it is. The service's competence ceiling means
+// most followers cannot identify a legendary item at all, so letting them name one here would
+// hand out for free exactly what the appraisal tiers are there to gate -- and would contradict
+// the same follower refusing to appraise it a moment later. Category and value band only.
+static void mymod_requestValuable(int pnum, Entity* f, Item* it, int value) {
+	if (!f || !it) return;
+	const Category cat = items[it->type].category;
+	const char* catName = (cat >= 0 && cat < CATEGORY_MAX) ? MYMOD_CATEGORY_NAMES[cat] : "thing";
+	// The unidentified name is what a bystander would see -- "a gold ring", "a curved sword".
+	const char* look = it->identified ? items[it->type].getIdentifiedName()
+	                                  : items[it->type].getUnidentifiedName();
+	std::string raceName = getMonsterLocalizedName(f->getRace(), f->getStats());
+	char tail[512];
+	snprintf(tail, sizeof(tail),
+		",\"remark\":\"valuable\",\"value\":%d,\"category\":\"%s\",\"look\":\"%s\"",
+		value, catName, mymod_jsonEscape(look ? look : "thing").c_str());
+	std::string payload = "{" + mymod_payloadHead(pnum, raceName, f->getUID(), "") + tail + "}";
+	mymod_fireRequest(pnum, payload, f->getUID(), false, raceName.c_str());
+	mymod_log("valuable: p%d picked up %s (%d gold); %s remarks",
+		pnum, look ? look : "?", value, raceName.c_str());
 }
 
 // CLIENT -> host ('MYID'): "here is the item I am holding out, and what it really is."
@@ -2117,8 +2196,6 @@ void mymod_identifyRequest(int pnum, int nth) {
 		items[it->type].getIdentifiedName(), unid, mymod_identDecoys(it), false,
 		mymod_appraisalValue(it));
 }
-
-static Entity* mymod_findFollower(int pnum);   // defined below
 
 // HOST: talk to a non-follower NPC. `greeting` is the line they volunteer when engaged.
 static void mymod_requestNPC(int pnum, Entity* npc, const std::string& says, bool greeting) {
@@ -2600,6 +2677,13 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		for (int c = 0; c < MAXPLAYERS; ++c) { mymod_partner[c] = 0; mymod_shopLine[c].clear(); }
 		mymod_watch.clear();
 		mymod_hurtCooldown.clear();
+		// ⚠ Re-seed silently next frame, or a new character's starting kit reads as a pile of
+		// treasure just picked up -- a Merchant begins with 1000 gold of it.
+		for (int c = 0; c < MAXPLAYERS; ++c) {
+			mymod_seenItems[c].clear();
+			mymod_seenSeeded[c] = false;
+		}
+		mymod_lastValuableTick = 0;
 		{ std::lock_guard<std::mutex> lk(mymod_traitsMutex); mymod_traits.clear(); }
 		mymod_watchLevel = -1;
 	}
