@@ -1818,6 +1818,17 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 
 static const int MYMOD_RATFEAR_PERCENT = 50;
 static const double MYMOD_RATFEAR_RANGE = 12 * 16;
+// ⚠ THE RAT THAT KILLED THE BARON IS MARKED ON ITS STAT, not by uid. Followers are RECREATED as
+// new entities on every level load (game.cpp:2455 copies their stats onto a fresh monster), so a
+// uid does not survive a staircase -- but Stat::copyStats() copies all 32 MISC_FLAGS and the
+// name (stat.cpp:641/679), so a flag set here rides down fifteen floors with the creature.
+// Indices 1-15 and 17-20 are spoken for; 21 is free.
+static const int MYMOD_RAT_SLAYER = 21;
+
+static bool mymod_isRatSlayer(Entity* e) {
+	Stat* s = e ? e->getStats() : nullptr;
+	return s && s->MISC_FLAGS[MYMOD_RAT_SLAYER] != 0;
+}
 static std::set<uint32_t> mymod_ratfearRolled;   // bosses already coin-flipped, per floor
 static bool   mymod_ratfearArmed = false;        // line requested, kill pending
 static int    mymod_ratfearPlayer = -1;
@@ -1825,7 +1836,9 @@ static Uint32 mymod_ratfearKillAt = 0;
 static bool   mymod_ratfearTwins = false;
 
 // A rat this player brought all the way down here, still alive and close to the boss.
+// ⚠ Prefers the SLAYER if one is present, because that rat does not roll -- it simply wins.
 static Entity* mymod_ratNear(Entity* boss) {
+	Entity* plain = nullptr;
 	if (!boss || !map.entities) return nullptr;
 	for (node_t* nd = map.entities->first; nd != NULL; nd = nd->next) {
 		Entity* e = (Entity*)nd->element;
@@ -1835,9 +1848,11 @@ static Entity* mymod_ratNear(Entity* boss) {
 		Stat* es = e->getStats();
 		if (!es || es->HP <= 0) continue;
 		const double dx = e->x - boss->x, dy = e->y - boss->y;
-		if (dx * dx + dy * dy <= MYMOD_RATFEAR_RANGE * MYMOD_RATFEAR_RANGE) return e;
+		if (dx * dx + dy * dy > MYMOD_RATFEAR_RANGE * MYMOD_RATFEAR_RANGE) continue;
+		if (mymod_isRatSlayer(e)) return e;      // the legend takes precedence
+		if (!plain) plain = e;
 	}
-	return nullptr;
+	return plain;
 }
 
 static void mymod_ratfearKill() {
@@ -2477,28 +2492,50 @@ static void mymod_remarkTick() {
 				: getMonsterLocalizedName(e->getRace(), es));
 			mymod_bossSeen[buid] = std::make_pair(bname, isMino);
 			// --- the rat ---
-			if (!isMino && !mymod_ratfearArmed && !mymod_ratfearRolled.count(buid)) {
-				if (Entity* rat = mymod_ratNear(e)) {
-					mymod_ratfearRolled.insert(buid);      // one flip per boss, win or lose
+			if (!isMino && !mymod_ratfearArmed) {
+				Entity* rat = mymod_ratNear(e);
+				// ⚠ THE SLAYER IGNORES THE COIN FLIP AND THE ROLLED-ALREADY SET. A rat that has
+				// already killed the Baron and survived fifteen floors has earned certainty --
+				// and it must still work if it only catches up to the twins later.
+				const bool legend = rat && mymod_isRatSlayer(rat);
+				if (rat && (legend || !mymod_ratfearRolled.count(buid))) {
+					if (!legend) mymod_ratfearRolled.insert(buid);   // one flip per boss
 					const int owner = mymod_ownerOf(rat);
-					if (owner >= 0 && local_rng.rand() % 100 < MYMOD_RATFEAR_PERCENT
+					if (owner >= 0
+						&& (legend || local_rng.rand() % 100 < MYMOD_RATFEAR_PERCENT)
 						&& !mymod_convo[owner].inflight.load()) {
 						mymod_ratfearArmed = true;
 						mymod_ratfearPlayer = owner;
 						mymod_ratfearTwins = (e->getRace() != LICH);
 						mymod_ratfearKillAt = 0;
+						// ⚠ Marked HERE, on the Baron only, and on the Stat so it survives the
+						// staircase. If this rat dies on the way down, the legend dies with it.
+						if (!mymod_ratfearTwins) {
+							if (Stat* rs = rat->getStats()) {
+								rs->MISC_FLAGS[MYMOD_RAT_SLAYER] = 1;
+							}
+						}
+						const char* ratName = "";
+						if (Stat* rs2 = rat->getStats()) {
+							if (rs2->name[0]) ratName = rs2->name;
+						}
 						// ⚠ Fired as an NPC so deliverSlot takes the non-follower branch: a
 						// bubble and a chat line, and none of the boons, renaming or ALLY_CMD
 						// machinery that a follower reply drags along.
 						char payload[512];
 						snprintf(payload, sizeof(payload),
 							"{\"ratfear\":true,\"race\":\"%s\",\"floor\":%d,\"map\":\"%s\","
-							"\"player\":%d,\"boss\":\"%s\"}",
+							"\"player\":%d,\"boss\":\"%s\",\"legend\":%s,"
+							"\"ratname\":\"%s\"}",
 							mymod_jsonEscape(getMonsterLocalizedName(e->getRace(), es)).c_str(),
 							currentlevel, mymod_jsonEscape(map.name).c_str(), owner,
-							mymod_jsonEscape(bname).c_str());
+							mymod_jsonEscape(bname).c_str(),
+							legend ? "true" : "false",
+							mymod_jsonEscape(ratName).c_str());
 						mymod_fireRequest(owner, payload, buid, true, "the Baron (rat)");
-						mymod_log("ratfear: TRIGGERED on %s by p%d's rat", bname.c_str(), owner);
+						mymod_log("ratfear: TRIGGERED on %s by p%d's %srat%s%s", bname.c_str(),
+							owner, legend ? "LEGENDARY " : "",
+							ratName[0] ? " " : "", ratName);
 					}
 				}
 			}
