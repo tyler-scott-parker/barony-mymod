@@ -1669,6 +1669,34 @@ static const int MYMOD_LEGENDARY_VALUE = 1500;
 // adds nothing to the upstream diff.
 static std::map<uint32_t, std::vector<Uint32>> mymod_followerKit;   // uid -> item uid per slot
 
+// ---- no clothes on -----------------------------------------------------------------------------
+// ⚠ "Clothes" is the ARMOUR slots only. A weapon, a shield and a fistful of rings are not an
+// outfit, and someone in nothing but a ring and a sword is exactly the case worth remarking on.
+static const int MYMOD_CLOTHES_SLOTS[] = { 0, 1, 2, 3, 6 };   // helm, body, gloves, boots, cloak
+static bool mymod_wasNaked[MAXPLAYERS] = { false };
+static bool mymod_nakedSeeded[MAXPLAYERS] = { false };
+
+static bool mymod_isNaked(int pnum) {
+	if (!stats[pnum]) return false;
+	for (int i : MYMOD_CLOTHES_SLOTS) {
+		if (mymod_equipAt(stats[pnum], i)) return false;
+	}
+	return true;
+}
+
+// ---- levitating ---------------------------------------------------------------------------------
+static bool mymod_wasLevitating[MAXPLAYERS] = { false };
+static bool mymod_levSeeded[MAXPLAYERS] = { false };
+
+// ---- boulders -----------------------------------------------------------------------------------
+// ⚠ Both cases are watched, not hooked, the same way the arrow trap is. A rolling boulder near a
+// player followed by an HP drop is a hit; a rolling boulder carrying a pusher in BOULDER_PLAYERPUSHED
+// (skill[8], actboulder.cpp:34) is a shove. Hooking the damage path would add entity.cpp to the
+// upstream diff for a flavour line.
+static Uint32 mymod_boulderNear[MAXPLAYERS] = { 0 };
+static std::set<uint32_t> mymod_boulderPushed;   // shoved boulders already remarked on, per floor
+static int mymod_boulderLevel = -1;
+
 // ---- rich and poor -----------------------------------------------------------------------------
 // ⚠ Bands, edge-triggered, like hunger. Calibrated against the economy the appraisal work
 // measured: starting gold is 0-250 for most classes, a floor pile is ~60+floor, and a shop sword
@@ -1940,6 +1968,32 @@ static void mymod_remarkTick() {
 			}
 		}
 
+		// --- wearing nothing at all ---
+		{
+			const bool naked = mymod_isNaked(pnum);
+			// ⚠ NOT suppressed at seed time, unlike the other watches: a character who starts
+			// the run with no clothes on is exactly the case worth a line.
+			if (naked && (!mymod_nakedSeeded[pnum] || !mymod_wasNaked[pnum])) {
+				if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+					mymod_requestRemark(pnum, f, "naked", "");
+				}
+			}
+			mymod_wasNaked[pnum] = naked;
+			mymod_nakedSeeded[pnum] = true;
+		}
+
+		// --- levitating ---
+		{
+			const bool lev = isLevitating(stats[pnum]);
+			if (lev && mymod_levSeeded[pnum] && !mymod_wasLevitating[pnum]) {
+				if (Entity* f = mymod_remarkSpeaker(pnum, false)) {
+					mymod_requestRemark(pnum, f, "levitate", "");
+				}
+			}
+			mymod_wasLevitating[pnum] = lev;
+			mymod_levSeeded[pnum] = true;
+		}
+
 		// --- rich or destitute ---
 		{
 			const int g = (int)stats[pnum]->GOLD;
@@ -1973,6 +2027,8 @@ static void mymod_remarkTick() {
 		}
 		mymod_wasSwimming[pnum] = swimming;
 
+		// --- flattened by a boulder ---
+		// ⚠ Must sit AFTER `hp` is read, below -- it shares the HP-drop edge with the arrow trap.
 		// --- shot by an arrow trap ---
 		// HP is compared against the previous frame; a drop within a few frames of a
 		// trap-fired arrow being close is the trap landing one.
@@ -2004,6 +2060,13 @@ static void mymod_remarkTick() {
 					(speakerOwner == pnum) ? "true" : "false",
 					canReturn ? "true" : "false");
 				mymod_requestRemark(speakerOwner, f, "death", extra);
+			}
+		}
+		if (mymod_hpSeeded[pnum] && hp < mymod_lastHP[pnum] && hp > 0
+			&& mymod_boulderNear[pnum] != 0 && ticks - mymod_boulderNear[pnum] <= 8) {
+			mymod_boulderNear[pnum] = 0;      // one line per boulder, not per tick of damage
+			if (Entity* f = mymod_remarkSpeaker(pnum, true, true)) {
+				mymod_requestRemark(pnum, f, "boulderhit", "");
 			}
 		}
 		mymod_lastHP[pnum] = hp;
@@ -2046,6 +2109,10 @@ static void mymod_remarkTick() {
 
 	// ⚠ Bosses are per-floor: leaving Herx's lair replaces the entity list, which would read
 	// exactly like his death.
+	if (currentlevel != mymod_boulderLevel) {
+		mymod_boulderLevel = currentlevel;
+		mymod_boulderPushed.clear();
+	}
 	if (currentlevel != mymod_bossLevel) {
 		mymod_bossLevel = currentlevel;
 		mymod_bossSeen.clear();
@@ -2079,6 +2146,29 @@ static void mymod_remarkTick() {
 	for (node_t* nd = map.entities->first; nd != NULL; nd = nd->next) {
 		Entity* e = (Entity*)nd->element;
 		if (!e) continue;
+		if (e->behavior == &actBoulder) {
+			if (e->skill[4] == 0) continue;                  // BOULDER_ROLLING
+			for (int c = 0; c < MAXPLAYERS; ++c) {
+				if (!players[c] || !players[c]->entity) continue;
+				const double dx = e->x - players[c]->entity->x;
+				const double dy = e->y - players[c]->entity->y;
+				if (dx * dx + dy * dy < (double)(2 * 16) * (2 * 16)) {
+					mymod_boulderNear[c] = ticks;
+				}
+			}
+			// ⚠ BOULDER_PLAYERPUSHED encodes telekinesis as index + MAXPLAYERS*n
+			// (actboulder.cpp:423), so the player is the remainder.
+			const int pusher = e->skill[8];
+			if (pusher >= 0 && mymod_boulderPushed.insert(e->getUID()).second) {
+				const int who = pusher % MAXPLAYERS;
+				if (players[who] && players[who]->entity) {
+					if (Entity* f = mymod_remarkSpeaker(who, false)) {
+						mymod_requestRemark(who, f, "boulderpush", "");
+					}
+				}
+			}
+			continue;
+		}
 		if (e->behavior == &actArrow && e->parent != 0) {
 			Entity* src = uidToEntity(e->parent);
 			if (src && src->behavior == &actArrowTrap) {
@@ -3477,6 +3567,11 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 			mymod_equipSeeded[c] = false;
 			mymod_goldSeeded[c] = false;
 			mymod_goldBand[c] = 0;
+			mymod_nakedSeeded[c] = false;
+			mymod_wasNaked[c] = false;
+			mymod_levSeeded[c] = false;
+			mymod_wasLevitating[c] = false;
+			mymod_boulderNear[c] = 0;
 			for (int i = 0; i < MYMOD_EQUIP_COUNT; ++i) mymod_lastEquip[c][i] = 0;
 			mymod_trapArrowNear[c] = 0;
 			mymod_hpSeeded[c] = false;
@@ -3493,6 +3588,8 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		mymod_lastMapName.clear();
 		mymod_skillLevel = -1;
 		mymod_followerKit.clear();
+		mymod_boulderPushed.clear();
+		mymod_boulderLevel = -1;
 		mymod_areaSeeded = false;
 		for (int t = 0; t < NUMMONSTERS; ++t) mymod_lastKills[t] = 0;
 		mymod_killsSeeded = false;
