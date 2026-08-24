@@ -325,6 +325,21 @@ static std::string mymod_jsonEscape(const std::string& in) {
 //  NETCODE
 // =============================================================================
 
+// ⚠ A std::string built straight from packet bytes reads until it finds a NUL -- which a
+// malformed, truncated or hostile datagram need not contain anywhere in the 512-byte buffer
+// (NET_PACKET_SIZE, game.hpp:38), so the read walks off the end of the allocation. net_packet->len
+// is how much actually arrived; bound by it AND by the buffer, and never trust the sender's NUL.
+// Vanilla reads packets this way throughout (net.cpp:3860, :4799), so this is hardening rather
+// than a fix for a crash anyone has seen -- but MYAI carries free text from another machine.
+static std::string mymod_packetString(size_t off) {
+	if (!net_packet || !net_packet->data || net_packet->len <= 0) return std::string();
+	size_t cap = (size_t)net_packet->len;
+	if (cap > (size_t)NET_PACKET_SIZE) cap = (size_t)NET_PACKET_SIZE;
+	if (off >= cap) return std::string();
+	const char* p = (const char*)(&net_packet->data[off]);
+	return std::string(p, strnlen(p, cap - off));
+}
+
 // CLIENT -> host: "player N said this to their follower". The host does all the compute.
 static void mymod_netSendSays(const std::string& says) {
 	if (multiplayer != CLIENT || !net_packet || !net_packet->data) return;
@@ -346,7 +361,7 @@ static void mymod_requestFromPlayer(int pnum, const std::string& says);  // fwd
 void mymod_netServerRecvSays() {
 	const int pnum = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));
 	client_keepalive[pnum] = ticks;
-	std::string says((const char*)(&net_packet->data[5]));
+	std::string says = mymod_packetString(5);
 	mymod_log("net: MYAI from client p%d (%d bytes)", pnum, (int)says.size());
 	mymod_requestFromPlayer(pnum, says);
 }
@@ -2420,6 +2435,11 @@ static void mymod_remarkTick() {
 		mymod_boulderLevel = currentlevel;
 		mymod_boulderPushed.clear();
 		mymod_fountainSeen.clear();
+		// ⚠ Mimics are per-floor too, and this set was cleared only on a new run. Entity uids
+		// are RECYCLED -- the counter is decremented all over the engine for cosmetic entities
+		// (actgib, actflame, ...) -- so a mimic whose uid was already seen on an earlier floor
+		// was silently skipped. That drops a REACTIVE warning whose whole point is being early.
+		mymod_seenMimics.clear();
 	}
 	if (currentlevel != mymod_bossLevel) {
 		mymod_bossLevel = currentlevel;
@@ -3143,7 +3163,7 @@ static void mymod_netSendShopLine(int pnum, const std::string& text) {
 
 // CLIENT: receive a merchant line for our own shop window. Registered as 'MYSH'.
 void mymod_netClientRecvShopLine() {
-	mymod_setShopLine(clientnum, std::string((const char*)(&net_packet->data[4])));
+	mymod_setShopLine(clientnum, mymod_packetString(4));
 }
 
 // HOST: fire one generation for player `pnum`. The JSON body is built on the main thread
@@ -3456,7 +3476,7 @@ void mymod_netServerRecvIdentify() {
 	size_t off = 10;
 	auto get = [&]() -> std::string {
 		if (off >= (size_t)net_packet->len) return std::string();
-		std::string s((const char*)(&net_packet->data[off]));
+		std::string s = mymod_packetString(off);
 		off += s.size() + 1;
 		return s;
 	};
@@ -4160,6 +4180,16 @@ void mymod_pollAI() {
 	mymod_loadServerConfig();
 	mymod_pollPTT();
 	mymod_holdShopLine();   // the shop GUI is local to whoever has it open, host or client
+	// ⚠ Shopkeepers do not survive a level change and entity uids are RECYCLED (reset to 1 on
+	// a new game, menu.cpp:8650, and decremented constantly for cosmetic entities), so a
+	// percentage left keyed to a dead merchant is inherited by an unrelated one later -- a
+	// price nobody negotiated, shown AND charged, since buyValue/sellValue both read it.
+	// Above the host gate on purpose: clients keep their own copy for display (MYHG).
+	static int mymod_haggleLevel = -1;
+	if (currentlevel != mymod_haggleLevel) {
+		mymod_haggleLevel = currentlevel;
+		mymod_haggle.clear();
+	}
 	if (!mymod_isHost()) {
 		return;   // clients receive dialogue as vanilla MSGS/BUBL packets; nothing to poll
 	}

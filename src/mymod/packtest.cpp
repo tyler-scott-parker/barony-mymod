@@ -49,6 +49,16 @@ static void unpack(int& pnum, Uint32& uid, std::string& cat, std::string& real,
     for(int k=0;k<nd;++k){ std::string d=get(); if(!d.empty()) decoys.push_back(d); }
     value = atoi(get().c_str());   // 0 from an older client that does not send it
 }
+// Lifted verbatim from mymod.cpp: the bounded field reader. A std::string built straight from
+// packet bytes reads until a NUL the sender is trusted to have written; a malformed, truncated or
+// hostile datagram need not contain one anywhere, and the read then walks off the buffer.
+static std::string boundedField(const Uint8* data, size_t len, size_t off){
+    if(!data || !len) return std::string();
+    size_t cap = len > (size_t)NET_PACKET_SIZE ? (size_t)NET_PACKET_SIZE : len;
+    if(off >= cap) return std::string();
+    const char* q = (const char*)(&data[off]);
+    return std::string(q, strnlen(q, cap - off));
+}
 static int fails=0;
 static void check(const char* label,int cn,Uint32 uid,const char* cat,const char* real,
                   const char* unid,std::vector<std::string> dec,int val=0){
@@ -88,6 +98,29 @@ int main(){
                ok?"PASS":"FAIL","over-long field",r.size(),n.c_str(),
                d.empty()?"-":d[0].c_str());
         if(!ok) fails++;
+    }
+    // ---- the bounded reader: every one of these overruns the buffer without it ----------
+    {
+        auto bk=[&](const char* label,bool ok){
+            printf("  [%s] %-34s\n", ok?"PASS":"FAIL", label); if(!ok) fails++; };
+        Uint8 buf[NET_PACKET_SIZE];
+
+        memset(buf,'A',sizeof(buf));                    // NOT a single NUL anywhere
+        bk("no NUL: stops at len", boundedField(buf,64,5)==std::string(59,'A'));
+        bk("no NUL: stops at buffer end", boundedField(buf,NET_PACKET_SIZE,0)
+                                          ==std::string(NET_PACKET_SIZE,'A'));
+        // a header claiming more than arrived must not licence reading past the allocation
+        bk("lying len is clamped", boundedField(buf,9999,0).size()==(size_t)NET_PACKET_SIZE);
+
+        memset(buf,0,sizeof(buf)); strcpy((char*)&buf[5],"hello");
+        bk("ordinary field still reads", boundedField(buf,64,5)=="hello");
+        bk("offset past len is empty",   boundedField(buf,4,5).empty());
+        bk("offset at len is empty",     boundedField(buf,5,5).empty());
+        bk("zero len is empty",          boundedField(buf,0,0).empty());
+        bk("null data is empty",         boundedField(nullptr,64,0).empty());
+        // a field whose NUL falls exactly on the last byte that arrived
+        memset(buf,'z',sizeof(buf)); buf[10]='\0';
+        bk("NUL on the final byte",      boundedField(buf,11,0)==std::string(10,'z'));
     }
     printf(fails? "\n%d FAILURE(S)\n" : "\nALL PASS\n", fails);
     return fails?1:0;
