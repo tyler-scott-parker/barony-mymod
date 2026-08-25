@@ -1625,7 +1625,12 @@ static Entity* mymod_remarkSpeaker(int pnum, int tier, bool inFight = false) {
 	if (!fs || fs->HP <= 0) return nullptr;
 	// ⚠ Admiring a gemstone while something is biting you reads as broken rather than as
 	// character -- but a kill happens IN a fight, and a mimic is worth interrupting for.
-	if (!reactive && !inFight && mymod_inCombat[f->getUID()]) return nullptr;
+	// ⚠ find(), not operator[] -- this runs every frame for every player, and subscripting a
+	// std::map INSERTS a default entry, so the map grew without bound over a run.
+	if (!reactive && !inFight) {
+		auto ic = mymod_inCombat.find(f->getUID());
+		if (ic != mymod_inCombat.end() && ic->second) return nullptr;
+	}
 	mymod_tierLast[tier] = ticks;
 	mymod_anyRemarkAt = ticks;
 	mymod_lastTierUsed = tier;      // for the log; read by the requestRemark that follows
@@ -2814,6 +2819,26 @@ static void mymod_remarkTick() {
 
 void mymod_ambientTick() {
 	if (!mymod_isHost()) return;
+	// ⚠ The same uid-recycling trap as mymod_seenMimics, and these two are FOLLOWER-keyed, which
+	// makes them worse: a level change re-creates every follower with a fresh uid (see the
+	// persistent-identity note above), so a recycled number lands on a different creature at the
+	// very next staircase rather than eventually.
+	//   mymod_inCombat    -- a stale `true` silently gags a follower for the whole floor (the
+	//                        !inFight gate in mymod_remarkSpeaker), and a stale `true` read while
+	//                        the creature is calm fires a fought_alongside nobody earned.
+	//   mymod_followerKit -- a recycled uid reads as `known`, so the silent seed is skipped and
+	//                        the creature's OWN gear diffs against the previous holder's slots:
+	//                        a "gift" remark for nothing given.
+	// ⚠ ABOVE the three ticks and the scan loop, not down with the mymod_watch reset. Both maps
+	// are READ before that point -- mymod_followerKit by mymod_remarkTick, mymod_inCombat by the
+	// scan itself -- so clearing there would let the stale value fire once on the arrival frame,
+	// which is precisely the frame that matters.
+	static int mymod_followerLevel = -1;
+	if (currentlevel != mymod_followerLevel) {
+		mymod_followerLevel = currentlevel;
+		mymod_inCombat.clear();
+		mymod_followerKit.clear();
+	}
 	mymod_heckleTick();
 	mymod_valuablesTick();
 	mymod_remarkTick();
@@ -4050,6 +4075,13 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		for (int c = 0; c < MAXPLAYERS; ++c) { mymod_partner[c] = 0; mymod_shopLine[c].clear(); }
 		mymod_watch.clear();
 		mymod_hurtCooldown.clear();
+		// ⚠ Also cleared per floor at the top of mymod_ambientTick, but that sentinel is a
+		// function-local static this block cannot reach: a run abandoned on floor 1 and restarted
+		// on floor 1 leaves currentlevel unchanged, so the per-floor clear never fires. And a new
+		// run is exactly when it matters -- entity_uids restarts at 1, making a collision
+		// near-certain rather than merely likely. mymod_followerKit is reset below for the same
+		// reason.
+		mymod_inCombat.clear();
 		// ⚠ Re-seed silently next frame, or a new character's starting kit reads as a pile of
 		// treasure just picked up -- a Merchant begins with 1000 gold of it.
 		for (int c = 0; c < MAXPLAYERS; ++c) {
