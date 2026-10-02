@@ -102,17 +102,14 @@ void initLichIce(Entity* my, Stat* myStats)
 			// doubles either direction if the informant is still alive when they spawn.
 			{
 				extern int mymod_twins_debuff;
-				extern uint32_t mymod_twins_informant;
 				extern int mymod_twins_who;
+				extern bool mymod_bossInformantAlive(bool twins);
 				extern void mymod_log(const char* fmt, ...);
 				if ( mymod_twins_debuff != 0 && mymod_twins_who == 1 )
 				{
-					int mult = 1;
-					if ( mymod_twins_informant != 0 )
-					{
-						Entity* inf = uidToEntity(mymod_twins_informant);
-						if ( inf && inf->getStats() && inf->getStats()->HP > 0 ) { mult = 2; }
-					}
+					// Tier 2 if the informant is still alive, matched by persist token (see
+					// monster_lich.cpp: the uid they had when they told is long gone).
+					int mult = mymod_bossInformantAlive(true) ? 2 : 1;
 					const int d = mymod_twins_debuff;
 					switch ( d > 0 ? d : -d )
 					{

@@ -9,6 +9,7 @@
 // of the game, so a plain TCP client costs no new library and no winsock #ifdefs.
 #pragma once
 
+#include <atomic>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -44,17 +45,34 @@ static bool mymod_parseServer(const std::string& url, std::string& host, Uint16&
 	return !host.empty() && port != 0;
 }
 
+// The status code of a raw HTTP response ("HTTP/1.0 500 Internal Server Error"), or 0.
+static int mymod_httpStatus(const std::string& raw) {
+	if (raw.compare(0, 5, "HTTP/") != 0) return 0;
+	const size_t sp = raw.find(' ');
+	if (sp == std::string::npos) return 0;
+	return atoi(raw.c_str() + sp + 1);
+}
+
+// Did the last request get an answer? Read by mymod_npcEngage, which has to decide BEFORE it
+// asks whether to hand the click to the service or leave vanilla's canned line in place.
+static std::atomic<bool> mymod_serviceAnswered{true};
+
 // Blocking POST of a JSON body; returns the response body. Called only from the detached
 // worker threads that already existed for the curl version, so nothing here blocks a frame.
+//
+// ⚠ Returns false, with `out` EMPTY, for anything but a 2xx. Every caller reads "reply" as the
+// speaker's line, and the status used to be ignored -- so a service exception came back as a
+// 500 whose reply was "(service error: ...)", and the follower SAID it, bubble and chat both.
+// An empty body is what every caller already treats as "nothing to say".
 static bool mymod_httpPost(const std::string& server, const std::string& body, std::string& out) {
 	out.clear();
 	std::string host; Uint16 port = 0;
-	if (!mymod_parseServer(server, host, port)) return false;
+	if (!mymod_parseServer(server, host, port)) { mymod_serviceAnswered.store(false); return false; }
 
 	IPaddress ip;
-	if (SDLNet_ResolveHost(&ip, host.c_str(), port) < 0) return false;
+	if (SDLNet_ResolveHost(&ip, host.c_str(), port) < 0) { mymod_serviceAnswered.store(false); return false; }
 	TCPsocket sock = SDLNet_TCP_Open(&ip);
-	if (!sock) return false;
+	if (!sock) { mymod_serviceAnswered.store(false); return false; }
 
 	char head[512];
 	const int n = snprintf(head, sizeof(head),
@@ -73,9 +91,12 @@ static bool mymod_httpPost(const std::string& server, const std::string& body, s
 		while ((got = SDLNet_TCP_Recv(sock, buf, sizeof(buf))) > 0) out.append(buf, got);
 	}
 	SDLNet_TCP_Close(sock);
-	if (!ok) return false;
+	if (!ok) { out.clear(); mymod_serviceAnswered.store(false); return false; }
+	const int status = mymod_httpStatus(out);
 	const size_t sep = out.find("\r\n\r\n");
 	out = (sep == std::string::npos) ? "" : out.substr(sep + 4);
+	if (status < 200 || status >= 300) { out.clear(); mymod_serviceAnswered.store(false); return false; }
+	mymod_serviceAnswered.store(true);
 	return true;
 }
 

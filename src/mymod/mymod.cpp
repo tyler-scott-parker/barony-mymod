@@ -29,6 +29,7 @@
 #include <cstdarg>
 #include <deque>
 #include <map>
+#include <random>
 #include <set>
 #include <unordered_map>
 #include <SDL.h>
@@ -80,6 +81,7 @@ struct MymodConvo {
 	uint32_t follower_uid = 0;  // who this slot is talking to (0 = world channel)
 	uint32_t speaker_uid = 0;   // whose head the bubble goes over
 	bool is_npc = false;        // conversation partner is a non-follower NPC, not a follower
+	bool failed = false;        // the service did not answer (down, or a non-2xx)
 };
 static MymodConvo mymod_convo[MYMOD_MAX_SLOTS];
 
@@ -97,6 +99,27 @@ int mymod_twins_debuff = 0;
 uint32_t mymod_twins_informant = 0;
 int mymod_twins_who = 0;
 uint32_t mymod_herx_informant = 0;
+// ⚠ The informant's PERSIST TOKEN, which is what tier 2 is actually judged by. The uids above
+// are the bodies they had when they spoke, and every follower gets a new uid at every staircase
+// -- so uidToEntity(informant) at the boss's spawn, floors later, found nobody and tier 2 never
+// fired. Kept for /aistatus and as the fallback for a service that does not send the token.
+Sint32 mymod_herx_informant_pid = 0;
+Sint32 mymod_twins_informant_pid = 0;
+
+static Entity* mymod_findByPersist(Sint32 token);   // defined with the persist token, below
+
+// Is the follower who told this boss's secret alive as the boss spawns? Called from the
+// initLich* hooks, which have no business knowing how a follower is identified.
+bool mymod_bossInformantAlive(bool twins) {
+	const Sint32 pid = twins ? mymod_twins_informant_pid : mymod_herx_informant_pid;
+	const uint32_t uid = twins ? mymod_twins_informant : mymod_herx_informant;
+	if (pid && mymod_findByPersist(pid)) return true;
+	if (!pid && uid) {
+		Entity* inf = uidToEntity(uid);
+		return inf && inf->getStats() && inf->getStats()->HP > 0;
+	}
+	return false;
+}
 
 std::string mymod_ai_server = "http://localhost:5001";  // host-side only (BYO-model)
 bool mymod_ptt_down = false;                            // is the push-to-talk key currently held?
@@ -199,8 +222,17 @@ static const int MYMOD_RAT_SLAYER = 21;   // MISC_FLAGS index; see the rat easte
 // key. So the engine stamps one into the creature's Stat, which copyStats() carries across the
 // transition (stat.cpp:679) exactly as it carries the name and the rat-slayer mark.
 static const int MYMOD_PERSIST_ID = 22;   // MISC_FLAGS index; 16 and 23-31 still free
-static Sint32 mymod_persistNext = 1;
 static int mymod_ownerOf(Entity* mon);    // defined below
+
+// ⚠ RANDOM, not a counter. The token outlives the process: save games write every follower's
+// MISC_FLAGS (scores.cpp:5978), so a counter restarting at 1 after a reload -- or after the
+// new_run reset that used to rewind it -- handed a fresh recruit the token of a follower who was
+// already carrying it, and the service then bound the two to ONE relationship row. Not
+// local_rng either: that is reseeded from uniqueGameKey, so a reloaded run replays its sequence.
+static Sint32 mymod_newPersistToken() {
+	static std::mt19937 gen(std::random_device{}() ^ (unsigned)SDL_GetPerformanceCounter());
+	return (Sint32)(gen() % 0x3FFFFFFFu) + 1;   // positive and never 0, which means "none"
+}
 
 // Assigned lazily and only to real followers -- an NPC or a hostile has no relationship to keep.
 static Sint32 mymod_persistIdOf(Entity* e) {
@@ -209,9 +241,21 @@ static Sint32 mymod_persistIdOf(Entity* e) {
 	Stat* st = e->getStats();
 	if (!st) return 0;
 	if (st->MISC_FLAGS[MYMOD_PERSIST_ID] == 0) {
-		st->MISC_FLAGS[MYMOD_PERSIST_ID] = mymod_persistNext++;
+		st->MISC_FLAGS[MYMOD_PERSIST_ID] = mymod_newPersistToken();
 	}
 	return st->MISC_FLAGS[MYMOD_PERSIST_ID];
+}
+
+// The follower carrying this token on the current floor, alive, or nullptr.
+static Entity* mymod_findByPersist(Sint32 token) {
+	if (!token || !map.entities) return nullptr;
+	for (node_t* nd = map.entities->first; nd != NULL; nd = nd->next) {
+		Entity* e = (Entity*)nd->element;
+		if (!e || e->behavior != &actMonster) continue;
+		Stat* s = e->getStats();
+		if (s && s->HP > 0 && s->MISC_FLAGS[MYMOD_PERSIST_ID] == token) return e;
+	}
+	return nullptr;
 }
 
 static bool mymod_nameIsLoadBearing(Entity* e) {
@@ -357,6 +401,29 @@ static void mymod_netSendSays(const std::string& says) {
 
 static void mymod_requestFromPlayer(int pnum, const std::string& says);  // fwd
 
+// CLIENT -> host ('MYNT'): a playtest note (/ailog, or a spoken "note ...") for the host's
+// session log. Same shape as MYAI. Without it a client's notes reached only their own terminal.
+static void mymod_netSendNote(const std::string& note) {
+	if (multiplayer != CLIENT || !net_packet || !net_packet->data) return;
+	const size_t maxlen = NET_PACKET_SIZE - 6;
+	std::string s = note.size() > maxlen ? note.substr(0, maxlen) : note;
+	strcpy((char*)net_packet->data, "MYNT");
+	net_packet->data[4] = (Uint8)clientnum;
+	strcpy((char*)(&net_packet->data[5]), s.c_str());
+	net_packet->address.host = net_server.host;
+	net_packet->address.port = net_server.port;
+	net_packet->len = 5 + s.length() + 1;
+	sendPacketSafe(net_sock, -1, net_packet, 0);
+}
+
+// HOST: a client's note. Registered as 'MYNT' in serverPacketHandlers.
+void mymod_netServerRecvNote() {
+	const int pnum = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));
+	client_keepalive[pnum] = ticks;
+	const std::string note = mymod_packetString(5);
+	if (!note.empty()) mymod_log("NOTE (p%d): %s", pnum, note.c_str());
+}
+
 // HOST: a client asked their follower something. Registered as 'MYAI' in serverPacketHandlers.
 void mymod_netServerRecvSays() {
 	const int pnum = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));
@@ -501,7 +568,11 @@ static int mymod_micHaveRate = MYMOD_MIC_RATE;
 
 static void mymod_micCallback(void*, Uint8* stream, int len) {
 	std::lock_guard<std::mutex> lk(mymod_micMutex);
-	const size_t cap = (size_t)MYMOD_MIC_RATE * MYMOD_MIC_MAX_SEC;
+	// ⚠ At the rate the device ACTUALLY runs. The buffer holds raw device samples and is only
+	// resampled to 16 kHz on release, so a cap counted at MYMOD_MIC_RATE stopped a 48 kHz mic --
+	// the usual Windows shared-mode rate -- at 5 seconds instead of 15, silently mid-sentence.
+	// (Written before the device is unpaused, so the callback always sees the final value.)
+	const size_t cap = (size_t)mymod_micHaveRate * MYMOD_MIC_MAX_SEC;
 	if (mymod_micBuf.size() >= cap) return;
 	const size_t add = std::min((size_t)(len / sizeof(int16_t)), cap - mymod_micBuf.size());
 	mymod_micBuf.insert(mymod_micBuf.end(), (int16_t*)stream, (int16_t*)stream + add);
@@ -644,7 +715,12 @@ static void mymod_transcribeClip(const std::vector<int16_t>& pcm) {
 	// half-written clip and transcribe silence.
 	const std::string wav = mymod_tmpPath("mymod_voice_clip.wav");
 	const std::string tmp = wav + ".part";
-	if (!mymod_writeWav(tmp, pcm) || rename(tmp.c_str(), wav.c_str()) != 0) {
+	// ⚠ rename() onto an existing file FAILS on Windows (POSIX replaces it), and a clip the
+	// bridge never picked up -- it is not running, or still busy with the last one -- is stale
+	// by now anyway. Without this, one unread clip broke every push-to-talk after it there.
+	const bool wrote = mymod_writeWav(tmp, pcm);
+	if (wrote) remove(wav.c_str());
+	if (!wrote || rename(tmp.c_str(), wav.c_str()) != 0) {
 		printlog("[MYMOD] voice: could not write the clip to %s", wav.c_str());
 		return;
 	}
@@ -811,6 +887,16 @@ static int               mymod_favourOwner = -1;
 static bool mymod_minoGuardUsed = false;       // once per RUN each -- not a free pass
 static bool mymod_sokobanDone   = false;
 static int  mymod_favourAskedLevel = -1;       // ask at most once per floor
+static bool mymod_favourFailed = false;        // the service did not answer the last ask
+static uint32_t mymod_favourRetryAt = 0;       // ...so the floor gets another go after this
+
+// ⚠ Who a player is ANSWERING. A quote lives on the follower who named it, but "yes" -- and a
+// second /aiidentify -- went to whichever follower was nearest, so with two companions the
+// acceptance could reach the one with nothing on the table and the deal never closed. For a
+// while after a figure is printed, its follower is the one being addressed. See mymod_addressee.
+static uint32_t mymod_quoter[MAXPLAYERS]   = { 0 };
+static uint32_t mymod_quoterAt[MAXPLAYERS] = { 0 };
+static const uint32_t MYMOD_QUOTE_WINDOW   = 90 * TICKS_PER_SECOND;
 
 // ---- The mercenary's fee ------------------------------------------------------------------
 // ⚠ NO NEW PACKET. 'GOLD' (net.cpp:4788) is an ABSOLUTE SET of a client's gold that vanilla
@@ -820,11 +906,17 @@ static int  mymod_favourAskedLevel = -1;       // ask at most once per floor
 // ⚠ Charging a REMOTE client races with their own shop. buyItemFromShop runs client-side
 // (interface/shopgui.cpp:1597 checks affordability against the client's own copy), so an
 // absolute set landing mid-purchase would clobber a transaction in flight. We simply do not
-// charge a player who has a shop open; the fee waits for the next reply.
+// charge a player who has a shop open; the fee is HELD and taken once the shop closes.
 static bool mymod_canChargeNow(int pnum) {
 	if (pnum < 0 || pnum >= MAXPLAYERS || !stats[pnum]) return false;
 	return !(players[pnum] && players[pnum]->shopGUI.bOpen);
 }
+
+// ⚠ Held here, on the main thread, NOT left in the conversation slot. The slot's `charge` is
+// overwritten by the next reply's worker, so a fee "waiting for the next reply" there was
+// simply lost -- and the job it paid for had already been done. Settled every frame by
+// mymod_settleHeldFees.
+static int mymod_heldFee[MAXPLAYERS] = { 0 };
 
 static void mymod_chargeGold(int pnum, int amount) {
 	if (pnum < 0 || pnum >= MAXPLAYERS || amount <= 0 || !stats[pnum]) return;
@@ -849,6 +941,29 @@ static void mymod_chargeGold(int pnum, int amount) {
 	messagePlayerColor(pnum, MESSAGE_INVENTORY, makeColorRGB(255, 216, 102),
 		"You hand over %d gold.", amount);
 	mymod_log("merc: charged p%d %d gold (%d left)", pnum, amount, (int)stats[pnum]->GOLD);
+}
+
+// Charge now, or hold it until this player's shop window closes.
+static void mymod_chargeOrHold(int pnum, int amount) {
+	if (pnum < 0 || pnum >= MAXPLAYERS || amount <= 0) return;
+	if (mymod_canChargeNow(pnum)) {
+		mymod_chargeGold(pnum, amount);
+	} else {
+		mymod_heldFee[pnum] += amount;
+		mymod_log("merc: fee of %d for p%d held, shop open (%d held)", amount, pnum,
+			mymod_heldFee[pnum]);
+	}
+}
+
+// Every frame, host-side: take any held fee as soon as its shop is closed.
+static void mymod_settleHeldFees() {
+	for (int c = 0; c < MAXPLAYERS; ++c) {
+		if (mymod_heldFee[c] > 0 && mymod_canChargeNow(c)) {
+			const int fee = mymod_heldFee[c];
+			mymod_heldFee[c] = 0;
+			mymod_chargeGold(c, fee);
+		}
+	}
 }
 
 // The command hints, printed ONCE per run, the first time a follower introduces itself.
@@ -905,6 +1020,15 @@ static Entity* mymod_findMinotaurTimer() {
 	return nullptr;
 }
 
+// Is there still a job to do? A deal struck in conversation can land after the job is gone --
+// the minotaur arrives 150-210s after its countdown starts, whether or not anyone has answered
+// the quote -- and charging for it then would be paying him to report work he never did.
+static bool mymod_favourPossible(const std::string& kind) {
+	if (kind == "minotaur") return mymod_findMinotaurTimer() != nullptr;
+	if (kind == "sokoban")  return !mymod_sokobanDone && !strncmp(map.name, "Sokoban", 7);
+	return false;
+}
+
 // The follower best placed to act: alive, nearest to their player, and not a machine.
 static Entity* mymod_favourCandidate(int& outOwner) {
 	Entity* best = nullptr;
@@ -933,18 +1057,30 @@ static void mymod_favourFetch(const char* kind, uint32_t uid, const std::string&
 	// prices Sokoban as a CUT rather than a fee. Both are things only the engine can know.
 	const int purse = (owner >= 0 && owner < MAXPLAYERS && stats[owner]) ? (int)stats[owner]->GOLD : 0;
 	const int here  = (!strcmp(kind, "sokoban")) ? mymod_goldOnFloor() : 0;
-	char payload[512];
+	// ⚠ WHO this is, not just which body. On a minotaur floor this request is the first thing the
+	// service hears about the follower's new uid (the engine asks the moment it sees the timer,
+	// i.e. at level load), and without the persist token and origin the service could not find
+	// the relationship: it judged a stranger -- trust 0, allegiance re-rolled -- so the guard
+	// refused every natural minotaur floor and every Sokoban, and the floor's talk went to that
+	// stranger's row.
+	std::string originKey;
+	Entity* who = uidToEntity(uid);
+	const char* origin = mymod_originName(mymod_originOf(who, &originKey));
+	char payload[768];
 	snprintf(payload, sizeof(payload),
 		"{\"favour\":\"%s\",\"uid\":%u,\"race\":\"%s\",\"floor\":%d,"
-		"\"player\":%d,\"map\":\"%s\",\"gold\":%d,\"gold_here\":%d}",
+		"\"player\":%d,\"map\":\"%s\",\"gold\":%d,\"gold_here\":%d,"
+		"\"origin\":\"%s\",\"origin_key\":\"%s\",\"persist\":%d}",
 		kind, (unsigned)uid, race.c_str(), currentlevel, owner,
-		mymod_jsonEscape(map.name).c_str(), purse, here);
+		mymod_jsonEscape(map.name).c_str(), purse, here,
+		origin, mymod_jsonEscape(originKey).c_str(), (int)mymod_persistIdOf(who));
 	std::string body = payload, server = mymod_ai_server, k = kind;
 	std::thread([body, server, uid, k, owner]() {
 		std::string resp;
-		mymod_httpPost(server, body, resp);
+		const bool answered = mymod_httpPost(server, body, resp);
 		{
 			std::lock_guard<std::mutex> lk(mymod_favourMutex);
+			mymod_favourFailed = !answered;
 			mymod_favourLine = mymod_jsonField(resp, "reply");
 			mymod_favourDo   = (mymod_jsonField(resp, "act") == "1");
 			mymod_favourWho  = uid;
@@ -1042,6 +1178,13 @@ static void mymod_favourTick() {
 	int charge = 0, owner = -1;
 	{
 		std::lock_guard<std::mutex> lk(mymod_favourMutex);
+		// ⚠ No answer at all -- the service is down, or it errored -- is not "no": the floor's
+		// one ask was spent on nothing, so it gets another after a pause instead of none.
+		if (mymod_favourFailed) {
+			mymod_favourFailed = false;
+			mymod_favourAskedLevel = -1;
+			mymod_favourRetryAt = ticks + 15 * TICKS_PER_SECOND;
+		}
 		if (!mymod_favourLine.empty() || mymod_favourDo) {
 			line.swap(mymod_favourLine);
 			kind.swap(mymod_favourKind);
@@ -1058,17 +1201,26 @@ static void mymod_favourTick() {
 	}
 	// Paid, then the job, then the line: the coin sound is the confirmation the deal went
 	// through, so it lands before he reports having done the work.
-	if (charge > 0 && owner >= 0) mymod_chargeGold(owner, charge);
+	if (act && !mymod_favourPossible(kind)) {
+		mymod_log("favour: the %s job is gone; nothing done, fee of %d waived", kind.c_str(), charge);
+		act = false;
+		charge = 0;
+	}
+	if (charge > 0 && owner >= 0) mymod_chargeOrHold(owner, charge);
 	if (act) mymod_performFavour(kind, who);
 	if (!line.empty()) mymod_broadcastLine(who, "", line);
 	if (!quote.empty() && owner >= 0) {
 		Entity* qe = uidToEntity(who);
 		Stat* qs = qe ? qe->getStats() : nullptr;
 		mymod_printQuote(owner, quote, (qs && qs->name[0]) ? qs->name : "");
+		mymod_quoter[owner] = who;
+		mymod_quoterAt[owner] = ticks;
 	}
 
 	if (mymod_favourBusy.load() || intro || !map.entities) return;
 	if (currentlevel == mymod_favourAskedLevel) return;
+	if (mymod_favourRetryAt && ticks < mymod_favourRetryAt) return;
+	mymod_favourRetryAt = 0;
 
 	const char* want = nullptr;
 	if (!mymod_minoGuardUsed && mymod_findMinotaurTimer()) {
@@ -1802,6 +1954,17 @@ static Item* mymod_equipAt(Stat* st, int i) {
 	return *(Item**)((char*)st + MYMOD_EQUIP_SLOTS[i].off);
 }
 
+// What a bystander can see of an item: its real name only once it is IDENTIFIED.
+// ⚠ The equip and gift remarks sent getIdentifiedName() unconditionally, so putting on an
+// unknown "gold ring" had the follower admire your ring of conflict -- free identification,
+// the exact leak the valuable-pickup and blessed/cursed remarks were written to avoid.
+static const char* mymod_lookOf(Item* it) {
+	if (!it) return "something";
+	const char* nm = it->identified ? items[it->type].getIdentifiedName()
+	                                : items[it->type].getUnidentifiedName();
+	return (nm && nm[0]) ? nm : "something";
+}
+
 // ⚠ An artifact is not just another helm. Reusing the appraisal ceiling rather than listing
 // ARTIFACT_* keeps one definition of "legendary" in the mod: everything over 1500 gold, which is
 // the tier the game itself reserves for a near-master appraiser (data/appraisal_tables.json).
@@ -1871,6 +2034,7 @@ static std::map<uint32_t, int> mymod_fountainSeen;    // uid -> skill[0] last se
 // ---- the biome you are standing in -------------------------------------------------------------
 static const int MYMOD_BIOME_CHANCE = 18;      // percent, once per floor
 static int mymod_biomeLevel = -1;
+static bool mymod_biomePending = false;   // rolled on arrival, waiting for a free speaker
 
 // ---- the bridges between biomes ----------------------------------------------------------------
 // ⚠ Matched on the map's INTERNAL name, which for all four transition levels contains
@@ -1896,7 +2060,9 @@ static bool mymod_goldSeeded[MAXPLAYERS] = { false };
 // split, each is a thing a companion would actually say on its own.
 static const int MYMOD_SKILL_BEST_CHANCE  = 15;   // percent, once per floor
 static const int MYMOD_SKILL_WORST_CHANCE = 15;   // percent, once per floor
-static int mymod_skillLevel = -1;              // floor this was last offered on
+// Per player, the floor this was last offered on, stored as floor + 1 so the zero-initialised
+// array means "never" whatever MAXPLAYERS is (floor 0, the start map, is a real floor).
+static int mymod_skillFloorTag[MAXPLAYERS] = { 0 };
 
 static const char* mymod_skillTier(int v) {
 	if (v >= SKILL_LEVEL_LEGENDARY) return "legendary";
@@ -2109,7 +2275,7 @@ static void mymod_valuablesTick() {
 			if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_IDLE)) {
 				char extra[160];
 				snprintf(extra, sizeof(extra), ",\"look\":\"%s\"",
-					mymod_jsonEscape(items[foundFood->type].getIdentifiedName()).c_str());
+					mymod_jsonEscape(mymod_lookOf(foundFood)).c_str());
 				mymod_requestRemark(pnum, f, "food", extra);
 			}
 		}
@@ -2173,7 +2339,11 @@ static void mymod_remarkTick() {
 			// ⚠ A legendary piece always gets a line. Putting on an artifact is not the sort
 			// of thing a companion notices only a third of the time.
 			Item* newIt = (changed >= 0) ? mymod_equipAt(stats[pnum], changed) : nullptr;
-			const bool legendary = newIt && mymod_appraisalValue(newIt) > MYMOD_LEGENDARY_VALUE;
+			// ⚠ Identified only. "No ordinary piece -- a thing like that is spoken about" on an
+			// item the player cannot yet name tells them it is an artifact, which is the same
+			// free appraisal the name leak below was.
+			const bool legendary = newIt && newIt->identified
+				&& mymod_appraisalValue(newIt) > MYMOD_LEGENDARY_VALUE;
 			// ⚠ THE AMULET OF STRANGULATION IS ITS OWN EVENT, and it is not the same event for
 			// everyone. It forces itself cursed on equip (items.cpp:2963), then chokes you --
 			// EXCEPT a skeleton, which the damage loop skips outright (entity.cpp:7724), and a
@@ -2211,7 +2381,7 @@ static void mymod_remarkTick() {
 					char extra[256];
 					snprintf(extra, sizeof(extra),
 						",\"look\":\"%s\",\"slot\":\"%s\",\"legendary\":%s",
-						mymod_jsonEscape(newIt ? items[newIt->type].getIdentifiedName() : "something").c_str(),
+						mymod_jsonEscape(mymod_lookOf(newIt)).c_str(),
 						MYMOD_EQUIP_SLOTS[changed].slot, legendary ? "true" : "false");
 					mymod_requestRemark(pnum, f, "equip", extra);
 				}
@@ -2220,8 +2390,10 @@ static void mymod_remarkTick() {
 		}
 
 		// --- what they are best and worst at, once per floor ---
-		if (mymod_skillLevel != currentlevel) {
-			mymod_skillLevel = currentlevel;
+		// ⚠ Once per floor PER PLAYER. A single latch inside this loop was spent by player 0,
+		// so in co-op nobody else's follower ever said a word about their skills.
+		if (mymod_skillFloorTag[pnum] != currentlevel + 1) {
+			mymod_skillFloorTag[pnum] = currentlevel + 1;
 			const bool wantBest  = (local_rng.rand() % 100 < MYMOD_SKILL_BEST_CHANCE);
 			const bool wantWorst = (local_rng.rand() % 100 < MYMOD_SKILL_WORST_CHANCE);
 			if (wantBest || wantWorst) {
@@ -2248,8 +2420,12 @@ static void mymod_remarkTick() {
 				if (ready) {
 					const int k = doBest ? hi : lo;
 					if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_IDLE)) {
+						// ⚠ "skilltier", NOT "tier". requestRemark already writes "tier" (the remark
+						// tier, an int, for the log), and a second "tier" key here made the JSON
+						// carry it twice: Python keeps the last, so the service's int() raised on
+						// "an expert" after generating, and the follower spoke the error text.
 						char extra[224];
-						snprintf(extra, sizeof(extra), ",\"skill\":\"%s\",\"tier\":\"%s\"",
+						snprintf(extra, sizeof(extra), ",\"skill\":\"%s\",\"skilltier\":\"%s\"",
 							mymod_jsonEscape(getSkillLangEntry(k)).c_str(),
 							mymod_skillTier(stats[pnum]->getProficiency(k)));
 						mymod_requestRemark(pnum, f, doBest ? "skillbest" : "skillworst", extra);
@@ -2282,16 +2458,6 @@ static void mymod_remarkTick() {
 			}
 			mymod_wasLevitating[pnum] = lev;
 			mymod_levSeeded[pnum] = true;
-		}
-
-		// --- the biome, occasionally ---
-		if (mymod_biomeLevel != currentlevel) {
-			mymod_biomeLevel = currentlevel;
-			if (local_rng.rand() % 100 < MYMOD_BIOME_CHANCE) {
-				if (Entity* f = mymod_remarkSpeaker(pnum, MYMOD_TIER_IDLE)) {
-					mymod_requestRemark(pnum, f, "biome", "");
-				}
-			}
 		}
 
 		// --- rich or destitute ---
@@ -2407,6 +2573,26 @@ static void mymod_remarkTick() {
 					mymod_requestRemark(c, f, "bridge", extra);
 					break;
 				}
+			}
+		}
+	}
+
+	// --- the biome, occasionally: one roll per floor, for the party ---
+	// ⚠ Out of the per-player loop. Inside it, one floor latch was spent by player 0 whether or
+	// not player 0 had a follower free to speak -- so in co-op it went to the host or to nobody,
+	// and even solo a roll that landed while the follower was busy was simply lost. The roll is
+	// made once on arrival and held until someone in the party can say it.
+	if (mymod_biomeLevel != currentlevel) {
+		mymod_biomeLevel = currentlevel;
+		mymod_biomePending = (local_rng.rand() % 100 < MYMOD_BIOME_CHANCE);
+	}
+	if (mymod_biomePending) {
+		for (int c = 0; c < MAXPLAYERS; ++c) {
+			if (!players[c] || !players[c]->entity) continue;
+			if (Entity* f = mymod_remarkSpeaker(c, MYMOD_TIER_IDLE)) {
+				mymod_requestRemark(c, f, "biome", "");
+				mymod_biomePending = false;
+				break;
 			}
 		}
 	}
@@ -2594,7 +2780,7 @@ static void mymod_remarkTick() {
 						Item* fit = mymod_equipAt(es, got);
 						char extra[256];
 						snprintf(extra, sizeof(extra), ",\"look\":\"%s\",\"slot\":\"%s\"",
-							mymod_jsonEscape(fit ? items[fit->type].getIdentifiedName() : "something").c_str(),
+							mymod_jsonEscape(mymod_lookOf(fit)).c_str(),
 							MYMOD_EQUIP_SLOTS[got].slot);
 						mymod_requestRemark(fowner, voice, "gift", extra);
 					}
@@ -2670,14 +2856,17 @@ static void mymod_remarkTick() {
 					const double dy = e->y - players[c]->entity->y;
 					if (dx * dx + dy * dy > (double)(20 * 16) * (20 * 16)) continue;
 					// Allowed mid-fight: you meet a boss BY fighting it.
+					// ⚠ `break` only once someone has spoken. It used to sit outside this `if`, so
+					// the first player in range with no follower free ended the search -- and,
+					// since the boss is not marked announced, ended it again every scan.
 					if (Entity* f = mymod_remarkSpeaker(c, MYMOD_TIER_REACTIVE)) {
 						mymod_bossAnnounced.insert(buid);
 						char extra[192];
 						snprintf(extra, sizeof(extra), ",\"look\":\"%s\"",
 							mymod_jsonEscape(bname).c_str());
 						mymod_requestRemark(c, f, isMino ? "minotaur" : "bossfight", extra);
+						break;
 					}
-					break;
 				}
 			}
 		}
@@ -2969,7 +3158,15 @@ void mymod_ambientTick() {
 				// whose leader changes, simply stops being anyone's follower and drops out of
 				// the loop above while still standing there. Only mourn a body that is really
 				// gone from the world.
-				if (uidToEntity(it->first) != nullptr) { it = mymod_watch.erase(it); continue; }
+				// ⚠ "Still standing" means ALIVE, not merely present. A follower killed after its
+				// own actMonster has run this frame stays in the entity list at HP 0 until its
+				// next act, and this sweep runs first thing in the frame -- so anything that
+				// acted after it (every arrow, spell and trap shot, every monster spawned
+				// mid-floor) left a corpse that read as "dismissed", and nobody grieved.
+				if (Entity* still = uidToEntity(it->first)) {
+					Stat* ss = still->getStats();
+					if (ss && ss->HP > 0) { it = mymod_watch.erase(it); continue; }
+				}
 				// ...and neither is a summon or a bot LEAVING. Recasting SUMMON kills the old
 				// pair outright (actmagic.cpp:14288 sets their HP to 0), and retrieving a
 				// sentrybot kills it to fold it back into the item (monster_sentrybot.cpp:521).
@@ -3100,6 +3297,18 @@ static Entity* mymod_findFollower(int pnum) {
 	return best;
 }
 
+// The follower a player's words are FOR: whoever just named a price, if that was recently and
+// they are still alive and still theirs; otherwise the nearest. See mymod_quoter.
+static Entity* mymod_addressee(int pnum) {
+	if (pnum >= 0 && pnum < MAXPLAYERS && mymod_quoter[pnum]
+		&& ticks - mymod_quoterAt[pnum] < MYMOD_QUOTE_WINDOW) {
+		Entity* q = uidToEntity(mymod_quoter[pnum]);
+		Stat* qs = q ? q->getStats() : nullptr;
+		if (q && qs && qs->HP > 0 && mymod_ownerOf(q) == pnum) return q;
+	}
+	return mymod_findFollower(pnum);
+}
+
 // ---- Non-follower NPCs: townsfolk, merchants, named characters ----------------
 // A player ENGAGES an NPC by clicking them (the game's own affordance), which makes that
 // NPC their conversation partner. /aicommand and voice then address the partner instead of
@@ -3208,7 +3417,7 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 	std::thread([payload, pnum, server]() {
 		MymodConvo& c = mymod_convo[pnum];
 		std::string body;
-		mymod_httpPost(server, payload, body);
+		const bool answered = mymod_httpPost(server, payload, body);
 
 		std::string speech = mymod_jsonField(body, "reply");
 		std::string action = mymod_jsonField(body, "action");
@@ -3232,11 +3441,15 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 		if (action.empty()) action = "NONE";
 		if (ident.empty())  ident = "0";
 		mymod_trimTail(speech);
-		if (speech.empty()) speech = "(no reply)";
-		c.ident = ident;
+		// ⚠ An empty reply stays EMPTY: it means "nothing to say", and deliverSlot says nothing.
+		// It used to become "(no reply)" and be spoken -- by every follower remark while the
+		// service was down, by an NPC instead of its vanilla line, and on any floor where the
+		// service deliberately declines a remark (a biome it has no words for returns "").
 		if (!sec.empty()) {
 			// "<debuff>:<uid>" for Herx, or "<debuff>:<uid>:twins:<who>" for the Archmagisters.
 			// who: 1 = Erudyce (LICH_ICE), 2 = Orpheus (LICH_FIRE). A NEGATIVE debuff is a buff.
+			// "informant" is that follower's persist token -- see mymod_bossInformantAlive.
+			const Sint32 pid = (Sint32)atol(mymod_jsonField(body, "informant").c_str());
 			size_t colon = sec.find(":");
 			if (colon != std::string::npos) {
 				const int d = atoi(sec.substr(0, colon).c_str());
@@ -3245,10 +3458,12 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 				if (sec.find(":twins:") != std::string::npos) {
 					mymod_twins_debuff = d;
 					mymod_twins_informant = inf;
+					mymod_twins_informant_pid = pid;
 					mymod_twins_who = atoi(sec.substr(sec.rfind(':') + 1).c_str());
 				} else {
 					mymod_herx_debuff = d;
 					mymod_herx_informant = inf;
+					mymod_herx_informant_pid = pid;
 				}
 			}
 		}
@@ -3257,6 +3472,8 @@ static void mymod_fireRequest(int pnum, const std::string& payload,
 			c.reply = speech; c.action = action; c.name = gname; c.boon = boon; c.haggle = hag;
 			c.sabotage = sab;
 			c.charge = atoi(chg.c_str()); c.favour = fav; c.quote = quo; c.hint = hnt;
+			c.ident = ident;
+			c.failed = !answered;
 		}
 		c.ready.store(true);
 	}).detach();
@@ -3300,21 +3517,28 @@ static std::string mymod_payloadHead(int pnum, const std::string& raceName, uint
 			if (ss->name[0]) engineName = ss->name;
 		}
 	}
+	// Whether a minotaur countdown still exists here, so the service can retire a quote to head
+	// it off once there is nothing left to head off (the minotaur arrived while nobody answered).
+	const int minoTimer = mymod_findMinotaurTimer() ? 1 : 0;
+	// ⚠ `says` goes in as a std::string, NOT through the fixed buffer: a client's MYAI line can
+	// be ~500 characters before escaping, and snprintf truncating the JSON mid-string made the
+	// whole request unparseable -- it failed as a 500 and the player's line simply vanished.
 	snprintf(buf, sizeof(buf),
-		"\"race\":\"%s\",\"floor\":%d,\"map\":\"%s\",\"says\":\"%s\",\"uid\":%u,"
+		"\"race\":\"%s\",\"floor\":%d,\"map\":\"%s\",\"uid\":%u,"
 		"\"player\":%d,\"player_name\":\"%s\",\"origin\":\"%s\",\"origin_key\":\"%s\","
-		"\"gold\":%d,\"player_kind\":\"%s\",\"follower_name\":\"%s\",\"persist\":%d",
-		raceName.c_str(), currentlevel, mymod_jsonEscape(map.name).c_str(),
-		mymod_jsonEscape(says).c_str(), (unsigned)uid,
+		"\"gold\":%d,\"player_kind\":\"%s\",\"follower_name\":\"%s\",\"persist\":%d,"
+		"\"mino_timer\":%d",
+		raceName.c_str(), currentlevel, mymod_jsonEscape(map.name).c_str(), (unsigned)uid,
 		pnum, mymod_jsonEscape(playerName).c_str(),
 		origin, mymod_jsonEscape(originKey).c_str(), purse,
 		mymod_jsonEscape(playerRace).c_str(), mymod_jsonEscape(engineName).c_str(),
-		(int)mymod_persistIdOf(uidToEntity(uid)));
+		(int)mymod_persistIdOf(uidToEntity(uid)), minoTimer);
+	std::string head = std::string(buf) + ",\"says\":\"" + mymod_jsonEscape(says) + "\"";
 	if (mymod_voiceOrigin) {
 		mymod_voiceOrigin = false;      // one request only
-		return std::string(buf) + ",\"via\":\"voice\"";
+		head += ",\"via\":\"voice\"";
 	}
-	return std::string(buf);
+	return head;
 }
 
 // ---- Item identification as a social reward (spec 9) -------------------------
@@ -3515,7 +3739,7 @@ void mymod_netServerRecvIdentify() {
 	}
 	decoysJson += "]";
 	const int value = atoi(get().c_str());   // trailing field; 0 from an older client
-	Entity* follower = mymod_findFollower(pnum);
+	Entity* follower = mymod_addressee(pnum);
 	if (!follower) {
 		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] nobody of yours nearby to ask");
 		return;
@@ -3574,7 +3798,7 @@ void mymod_identifyRequest(int pnum, int nth) {
 		mymod_netSendIdentify(it, nth);
 		return;
 	}
-	Entity* follower = mymod_findFollower(pnum);
+	Entity* follower = mymod_addressee(pnum);
 	if (!follower) {
 		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] nobody of yours nearby to ask");
 		return;
@@ -3610,7 +3834,7 @@ static void mymod_requestNPC(int pnum, Entity* npc, const std::string& says, boo
 
 // HOST: run one generation for player `pnum` against their nearest follower.
 static void mymod_requestFollower(int pnum, const std::string& says) {
-	Entity* follower = mymod_findFollower(pnum);
+	Entity* follower = mymod_addressee(pnum);
 	if (!follower) {
 		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] nobody of yours nearby to talk to");
 		return;
@@ -3700,8 +3924,20 @@ void mymod_debugStatus(int pnum) {
 		(void)e;
 	}
 	if (mymod_herx_debuff > 0) {
-		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] herx debuff=%d informant=%u",
-			mymod_herx_debuff, (unsigned)mymod_herx_informant);
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] herx debuff=%d informant=%u token=%d alive=%d",
+			mymod_herx_debuff, (unsigned)mymod_herx_informant, (int)mymod_herx_informant_pid,
+			mymod_bossInformantAlive(false) ? 1 : 0);
+	}
+	if (mymod_twins_debuff != 0) {
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] twins debuff=%d who=%d informant=%u token=%d alive=%d",
+			mymod_twins_debuff, mymod_twins_who, (unsigned)mymod_twins_informant,
+			(int)mymod_twins_informant_pid, mymod_bossInformantAlive(true) ? 1 : 0);
+	}
+	for (int c = 0; c < MAXPLAYERS; ++c) {
+		if (mymod_heldFee[c] > 0) {
+			messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] p%d owes a held fee of %d (shop open)",
+				c, mymod_heldFee[c]);
+		}
 	}
 }
 
@@ -3715,6 +3951,11 @@ bool mymod_npcEngage(int pnum, Entity* npc) {
 	if (!mymod_isHost()) return false;
 	if (pnum < 0 || pnum >= MAXPLAYERS) return false;
 	if (!mymod_isTalkableNPC(npc)) return false;
+	// ⚠ The promise at the hook -- "an NPC is never mute if the service is down" -- needs this.
+	// Returning true suppresses vanilla's canned line before anything is known, so with the
+	// service down the NPC used to say "(no reply)" instead. After a failed request, vanilla
+	// keeps the click until something gets through again.
+	if (!mymod_serviceAnswered.load()) return false;
 	const bool switching = (mymod_partner[pnum] != npc->getUID());
 	mymod_partner[pnum] = npc->getUID();
 	if (mymod_convo[pnum].inflight.load()) return false;  // already mid-line; don't queue a second
@@ -3789,11 +4030,14 @@ static void mymod_deliverSlot(int slot) {
 	if (!cv.ready.load()) return;
 	std::string reply, action, gname, boon, haggle, sabotage, favour, quote, hint;
 	int charge = 0;
+	bool failed = false;
 	{
 		std::lock_guard<std::mutex> lock(cv.mutex);
 		reply = cv.reply; action = cv.action; gname = cv.name; boon = cv.boon; haggle = cv.haggle;
 		sabotage = cv.sabotage;
 		charge = cv.charge; favour = cv.favour; quote = cv.quote; hint = cv.hint;
+		failed = cv.failed;
+		cv.failed = false;
 	}
 	// Applied on the main thread, before the line is spoken: the tell should land at the same
 	// moment the clock starts, not after it.
@@ -3815,15 +4059,33 @@ static void mymod_deliverSlot(int slot) {
 	// The mercenary is PAID FIRST, then does the job -- the coin sound is the player's
 	// confirmation that the deal went through, and it should land before he reports the work.
 	// ⚠ Deferred while a shop is open: 'GOLD' is an absolute set and would clobber a
-	// client-side purchase in flight (interface/shopgui.cpp:1597).
+	// client-side purchase in flight (interface/shopgui.cpp:1597). See mymod_heldFee.
 	{
 		const int payer = (slot < MAXPLAYERS) ? slot : clientnum;
-		if (charge > 0) {
-			if (mymod_canChargeNow(payer)) { mymod_chargeGold(payer, charge); cv.charge = 0; }
-			else                           { mymod_log("merc: fee of %d for p%d held, shop open",
-			                                           charge, payer); }
+		// ⚠ A deal struck after the job vanished -- the minotaur arrived before "yes" -- is not
+		// charged, and nothing is "done". The service retires such a quote itself when the engine
+		// says the countdown is gone; this covers a service that predates that.
+		if (!favour.empty() && !mymod_favourPossible(favour)) {
+			mymod_log("merc: the %s job is gone; fee of %d waived", favour.c_str(), charge);
+			charge = 0;
+			favour.clear();
 		}
-		if (!favour.empty()) { mymod_performFavour(favour, cv.follower_uid); cv.favour.clear(); }
+		if (charge > 0) mymod_chargeOrHold(payer, charge);
+		cv.charge = 0;
+		if (!favour.empty()) mymod_performFavour(favour, cv.follower_uid);
+		cv.favour.clear();
+	}
+	// ⚠ The service did not answer. Nothing is spoken (an empty reply is "nothing to say"), but
+	// a player who is waiting on a reply deserves to know why none came -- once a minute at most,
+	// since every remark the mod tries will fail the same way until the service is back.
+	if (failed && slot < MAXPLAYERS) {
+		static uint32_t lastHint[MAXPLAYERS] = { 0 };
+		if (!lastHint[slot] || ticks - lastHint[slot] >= 60 * TICKS_PER_SECOND) {
+			lastHint[slot] = ticks;
+			messagePlayer(slot, MESSAGE_MISC,
+				"[MYMOD] no answer from the AI service at %s (is service.py running?)",
+				mymod_ai_server.c_str());
+		}
 	}
 	cv.ready.store(false);
 	cv.inflight.store(false);
@@ -3843,7 +4105,7 @@ static void mymod_deliverSlot(int slot) {
 	if (!isWorld && cv.is_npc) {
 		const bool inShop = (players[pnum] && players[pnum]->shopGUI.bOpen
 			&& shopkeeper[pnum] == cv.follower_uid);
-		if (inShop) {
+		if (inShop && !reply.empty()) {
 			if (players[pnum]->isLocalPlayer()) mymod_setShopLine(pnum, reply);
 			else                                mymod_netSendShopLine(pnum, reply);
 		}
@@ -3853,7 +4115,7 @@ static void mymod_deliverSlot(int slot) {
 		char pbuf[192];
 		snprintf(pbuf, sizeof(pbuf), "%s: ", who.c_str());
 		// Bubble only when the line is not already being shown inside the shop window.
-		mymod_broadcastLine(inShop ? 0 : cv.speaker_uid, pbuf, reply);
+		if (!reply.empty()) mymod_broadcastLine(inShop ? 0 : cv.speaker_uid, pbuf, reply);
 		cv.prefix.clear();
 		cv.speaker_uid = 0;
 		cv.follower_uid = 0;
@@ -3867,7 +4129,11 @@ static void mymod_deliverSlot(int slot) {
 	// Item identification: only a claim that was BOTH correct and honest actually identifies
 	// the item. A lie or an honest mistake leaves it exactly as it was, and the player finds
 	// out the hard way.
-	if (mymod_identItem[pnum] != 0) {
+	// ⚠ Player slots only. The world slot resolves `pnum` to the host, so an ambient line or a
+	// taunt delivered while the host's /aiidentify was in flight used to consume THIS block with
+	// the world slot's empty verdict: the item stayed unidentified, the pending request was
+	// cleared, and the real (truthful) answer arriving a second later had nothing to apply to.
+	if (!isWorld && mymod_identItem[pnum] != 0) {
 		std::string verdict;
 		{ std::lock_guard<std::mutex> lock(cv.mutex); verdict = cv.ident; }
 		const bool truthful = (verdict == "1");
@@ -3932,7 +4198,9 @@ static void mymod_deliverSlot(int slot) {
 	// trying to read. Same call the dummybot heckler already makes, and for the same reason --
 	// the line still appears over the monster's head, which is where the player is looking.
 	// Ambient babble keeps its chat line: it is rare (0.3/min measured) and it is scene-setting.
-	if (isWorld && cv.prefix == "[taunt] ") {
+	if (reply.empty()) {
+		// nothing to say -- see the worker in mymod_fireRequest
+	} else if (isWorld && cv.prefix == "[taunt] ") {
 		mymod_broadcastBubble(cv.speaker_uid, reply);
 	} else {
 		mymod_broadcastLine(cv.speaker_uid, prefix, reply);
@@ -3942,6 +4210,10 @@ static void mymod_deliverSlot(int slot) {
 	if (!quote.empty()) {
 		Stat* qs = follower ? follower->getStats() : nullptr;
 		mymod_printQuote(pnum, quote, (qs && qs->name[0]) ? qs->name : "");
+		if (!isWorld && pnum >= 0 && pnum < MAXPLAYERS) {
+			mymod_quoter[pnum] = cv.follower_uid;
+			mymod_quoterAt[pnum] = ticks;
+		}
 	}
 	// After their line, so it reads as a footnote to what they just offered rather than as a
 	// banner in front of it.
@@ -4048,6 +4320,14 @@ void mymod_playerNote(int pnum, const std::string& text) {
 		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] usage: /ailog <what just went wrong>");
 		return;
 	}
+	// ⚠ A CLIENT's note has to travel to the host: mymod_log only reaches the service from the
+	// host, so a co-op friend's /ailog -- typed or spoken -- went to their own terminal and was
+	// confirmed as "noted in the session log" while the log never saw it. 'MYNT' carries it.
+	if (multiplayer == CLIENT) {
+		mymod_netSendNote(text);
+		messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] noted in the host's session log");
+		return;
+	}
 	mymod_log("NOTE (p%d): %s", pnum, text.c_str());
 	messagePlayer(pnum, MESSAGE_MISC, "[MYMOD] noted in the session log");
 }
@@ -4057,6 +4337,15 @@ void mymod_playerNote(int pnum, const std::string& text) {
 // reach the service; in particular a client firing "new_run" would wipe the host's run state.
 void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor) {
 	mymod_recordEventAbout(etype, uid, raceEnum, floor, 0);
+}
+
+// files.cpp, from physfsLoadMapFile, before the level is read.
+// ⚠ A run starts on `startfloor`, which is 0: line 0 of levels.txt is "map: start". The hook
+// used to test `levelToLoad <= 1`, so the stairs down to floor 1 started a SECOND new run in
+// every game -- visible in the first real session as two new_run records 18s apart. Anything
+// done on the start map (a summon cast there, a recruit) was wiped at the first staircase.
+void mymod_onLevelLoad(int levelToLoad) {
+	if (levelToLoad == startfloor) mymod_recordEvent("new_run", 0, 0, 0);
 }
 
 static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum, int floor,
@@ -4072,7 +4361,24 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		mymod_sokobanDone = false;
 		mymod_sokobanQueue.clear();
 		mymod_favourAskedLevel = -1;
-		for (int c = 0; c < MAXPLAYERS; ++c) { mymod_partner[c] = 0; mymod_shopLine[c].clear(); }
+		mymod_favourRetryAt = 0;
+		// ⚠ What a follower told you about a boss belongs to THIS run. The service forgets its
+		// secret on new_run and then sends an empty field, which the reply reader rightly treats
+		// as "no change" -- so without this the next Herx (in the same session) spawned with the
+		// last run's debuff, and a spy's lie kept buffing the twins.
+		mymod_herx_debuff = 0;
+		mymod_herx_informant = 0;
+		mymod_herx_informant_pid = 0;
+		mymod_twins_debuff = 0;
+		mymod_twins_informant = 0;
+		mymod_twins_informant_pid = 0;
+		mymod_twins_who = 0;
+		for (int c = 0; c < MAXPLAYERS; ++c) {
+			mymod_partner[c] = 0;
+			mymod_shopLine[c].clear();
+			mymod_heldFee[c] = 0;
+			mymod_quoter[c] = 0;
+		}
 		mymod_watch.clear();
 		mymod_hurtCooldown.clear();
 		// ⚠ Also cleared per floor at the top of mymod_ambientTick, but that sentinel is a
@@ -4117,7 +4423,7 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		mymod_ratfearPlayer = -1;
 		mymod_ratfearKillAt = 0;
 		mymod_lastMapName.clear();
-		mymod_skillLevel = -1;
+		for (int c = 0; c < MAXPLAYERS; ++c) mymod_skillFloorTag[c] = 0;
 		mymod_followerKit.clear();
 		mymod_boulderPushed.clear();
 		mymod_boulderLevel = -1;
@@ -4125,13 +4431,15 @@ static void mymod_recordEventAbout(const char* etype, uint32_t uid, int raceEnum
 		mymod_wallLevel = -1;
 		mymod_fountainSeen.clear();
 		mymod_biomeLevel = -1;
+		mymod_biomePending = false;
 		mymod_lastBridge.clear();
 		mymod_areaSeeded = false;
 		for (int t = 0; t < NUMMONSTERS; ++t) mymod_lastKills[t] = 0;
 		mymod_killsSeeded = false;
 		{ std::lock_guard<std::mutex> lk(mymod_traitsMutex); mymod_traits.clear(); }
 		mymod_watchLevel = -1;
-		mymod_persistNext = 1;
+		// (No persist counter to rewind: tokens are random -- see mymod_newPersistToken. The old
+		// rewind to 1 here is how a recruit could inherit a carried follower's token.)
 	}
 	std::string t = etype ? etype : "";
 	std::string r = getMonsterLocalizedName((Monster)raceEnum);
@@ -4227,6 +4535,7 @@ void mymod_pollAI() {
 	}
 	mymod_minotaurWarningTick();
 	mymod_riggedTrapTick();
+	mymod_settleHeldFees();
 	mymod_favourTick();
 	mymod_sokobanTick();
 	mymod_syncFriendly();   // no-op unless /friendly changed or a client just joined

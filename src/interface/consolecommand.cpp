@@ -972,8 +972,11 @@ static ConsoleCommand ccmd_aiforceattack("/aiforceattack", "MYMOD: directly orde
 		messagePlayer(clientnum, MESSAGE_MISC, "[MYMOD] AI server set to: %s", mymod_ai_server.c_str());
 		});
 
+// ⚠ NOT cheat-gated. This is how a player talks to their companion -- the in-game hint and the
+// friends' README both tell them to type it -- and with the gate (copied from /aitest when both
+// were added) it answered "Cheats are disabled on this server." in every normal game, leaving
+// voice as the host's only way to speak. The debug commands around it keep their gate.
 static ConsoleCommand ccmd_aicommand("/aicommand", "MYMOD: talk to your follower, or whoever you engaged (typed)", []CCMD{
-		if (!(svFlags & SV_FLAG_CHEATS)) { messagePlayer(clientnum, MESSAGE_MISC, Language::get(277)); return; }
 		std::string says;
 		for (int i = 1; i < argc; ++i) { if (i > 1) says += " "; says += argv[i]; }
 		// No text: stop addressing the NPC you engaged and go back to your own follower.
@@ -991,8 +994,8 @@ static ConsoleCommand ccmd_aicommand("/aicommand", "MYMOD: talk to your follower
 		mymod_playerNote(clientnum, note);
 		});
 
+	// Not cheat-gated either: an appraisal is earned (trust, or a mercenary's fee), not a cheat.
 	static ConsoleCommand ccmd_aiidentify("/aiidentify", "MYMOD: ask your follower what an unidentified item is", []CCMD{
-		if (!(svFlags & SV_FLAG_CHEATS)) { messagePlayer(clientnum, MESSAGE_MISC, Language::get(277)); return; }
 		mymod_identifyRequest(clientnum, argc > 1 ? atoi(argv[1]) : 1);
 		});
 

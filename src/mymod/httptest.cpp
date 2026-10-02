@@ -8,6 +8,28 @@
 #include <SDL_net.h>
 #include "mymod_net.hpp"
 #include <iostream>
+#include <thread>
+
+// Serve ONE canned response on `port`, then close. Enough to drive mymod_httpPost through a
+// status line it must refuse, without needing the real service to fail on cue.
+static void serveOnce(Uint16 port, std::string response) {
+	IPaddress ip;
+	if (SDLNet_ResolveHost(&ip, nullptr, port) < 0) return;
+	TCPsocket server = SDLNet_TCP_Open(&ip);
+	if (!server) return;
+	TCPsocket client = nullptr;
+	for (int i = 0; i < 300 && !client; ++i) {   // ~3s, then give up
+		client = SDLNet_TCP_Accept(server);
+		if (!client) SDL_Delay(10);
+	}
+	if (client) {
+		char buf[2048];
+		SDLNet_TCP_Recv(client, buf, sizeof(buf));
+		SDLNet_TCP_Send(client, response.data(), (int)response.size());
+		SDLNet_TCP_Close(client);
+	}
+	SDLNet_TCP_Close(server);
+}
 
 static int fails = 0;
 static void ck(const char* label, bool cond, const std::string& got = "") {
@@ -66,6 +88,11 @@ int main(int argc, char** argv) {
 	ck("temp path is absolute and named", mymod_tmpPath("x.json").find("x.json") != std::string::npos,
 	   mymod_tmpPath("x.json"));
 
+	// ---- status lines ----
+	ck("200 read", mymod_httpStatus("HTTP/1.0 200 OK\r\n\r\n{}") == 200);
+	ck("500 read", mymod_httpStatus("HTTP/1.0 500 Internal Server Error\r\n\r\n{}") == 500);
+	ck("no status line is 0", mymod_httpStatus("{\"reply\": \"hi\"}") == 0);
+
 	// ---- live round trip, if a service is running ----
 	if (SDLNet_Init() == 0) {
 		const std::string url = argc > 1 ? argv[1] : "http://localhost:5001";
@@ -78,6 +105,29 @@ int main(int argc, char** argv) {
 		std::string junk;
 		ck("a dead port fails cleanly rather than hanging",
 		   !mymod_httpPost("http://127.0.0.1:1", "{}", junk));
+		ck("...and marks the service as not answering", !mymod_serviceAnswered.load());
+
+		// ⚠ The bug this guards: a 500 used to be read like any reply, and its body's "reply"
+		// -- "(service error: ...)" -- was spoken by the follower in a bubble and the chat feed.
+		const Uint16 mock = 50771;
+		std::thread srv(serveOnce, mock, std::string(
+			"HTTP/1.0 500 Internal Server Error\r\nContent-Type: application/json\r\n\r\n"
+			"{\"reply\": \"(service error: invalid literal for int())\"}"));
+		SDL_Delay(100);
+		std::string body500 = "stale";
+		const bool ok500 = mymod_httpPost("http://127.0.0.1:50771", "{}", body500);
+		srv.join();
+		ck("a 500 is a failure, not a reply", !ok500);
+		ck("...and leaves nothing for a caller to speak", body500.empty(), body500);
+
+		std::thread srv2(serveOnce, (Uint16)(mock + 1), std::string(
+			"HTTP/1.0 200 OK\r\nContent-Type: application/json\r\n\r\n{\"reply\": \"Aye.\"}"));
+		SDL_Delay(100);
+		std::string body200;
+		const bool ok200 = mymod_httpPost("http://127.0.0.1:50772", "{}", body200);
+		srv2.join();
+		ck("a 200 is a reply", ok200 && mymod_jsonField(body200, "reply") == "Aye.", body200);
+		ck("...and marks the service as answering again", mymod_serviceAnswered.load());
 		SDLNet_Quit();
 	}
 

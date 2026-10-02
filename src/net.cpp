@@ -7682,6 +7682,9 @@ static std::unordered_map<Uint32, void(*)()> serverPacketHandlers = {
 	// MYMOD: a client is holding out an item for its follower to identify
 	{'MYID', [](){ mymod_netServerRecvIdentify(); }},
 
+	// MYMOD: a client's playtest note (/ailog), for the host's session log
+	{'MYNT', [](){ mymod_netServerRecvNote(); }},
+
 	// message
 	{'MSGS', [](){
 		const int pnum = std::min(net_packet->data[4], (Uint8)(MAXPLAYERS - 1));

@@ -15,7 +15,10 @@ class Entity;
 // --- globals still referenced from upstream files ---
 extern std::string mymod_ai_server;   // configurable backend endpoint (BYO-model), host-side only
 extern int mymod_herx_debuff;         // 0 none, 1..4 = revealed weakness variant (run-global)
-extern uint32_t mymod_herx_informant; // uid of the follower who told; tier-2 if alive at spawn
+extern uint32_t mymod_herx_informant; // uid of the follower who told (at the time they told)
+// Tier 2: is the follower who told this boss's secret alive at its spawn? Matched by persist
+// token, because the uid above is a body from floors ago. Called from the initLich* hooks.
+bool mymod_bossInformantAlive(bool twins);
 
 // --- entry points called from upstream files ---
 void mymod_pollAI();                                  // game.cpp, per frame
@@ -23,11 +26,13 @@ void mymod_ambientTick();                             // host only; called from 
 void mymod_sendToFollower(const std::string& says);   // local entry: /aicommand + voice bridge
 void mymod_loadServerConfig();
 void mymod_recordEvent(const char* etype, uint32_t uid, int raceEnum, int floor);
+void mymod_onLevelLoad(int levelToLoad);              // files.cpp: starts a new run on startfloor
 void mymod_debugPing();                               // /aitest
 bool mymod_busy(int player);                          // is this player mid-generation?
 
 // --- netcode entry points, registered in net.cpp's packet tables ---
 void mymod_netServerRecvSays();   // 'MYAI'  client -> host: "my player said X to their follower"
+void mymod_netServerRecvNote();   // 'MYNT'  client -> host: a playtest note for the session log
 // A client with NO mod installed, talking through ordinary in-game chat. Called from the
 // vanilla 'MSGS' server handler; returns true if the line was an AI utterance.
 bool mymod_clientChat(int pnum, const char* msg);

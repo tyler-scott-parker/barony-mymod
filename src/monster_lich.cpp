@@ -95,15 +95,13 @@ void initLich(Entity* my, Stat* myStats)
 			// informant is still alive when he spawns.
 			{
 				extern int mymod_herx_debuff;
-				extern uint32_t mymod_herx_informant;
+				extern bool mymod_bossInformantAlive(bool twins);
 				if ( mymod_herx_debuff > 0 )
 				{
-					int mult = 1;
-					if ( mymod_herx_informant != 0 )
-					{
-						Entity* inf = uidToEntity(mymod_herx_informant);
-						if ( inf && inf->getStats() && inf->getStats()->HP > 0 ) { mult = 2; }
-					}
+					// Tier 2 if the informant is still alive -- matched by persist token: the uid
+					// they had when they told is a body from floors ago (followers get new uids
+					// at every staircase), so looking THAT up never found anyone.
+					int mult = mymod_bossInformantAlive(false) ? 2 : 1;
 					switch ( mymod_herx_debuff )
 					{
 						case 1: myStats->CON = std::max(0, myStats->CON - 3 * mult); break;
