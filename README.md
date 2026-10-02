@@ -27,12 +27,12 @@ for this project. Read that before changing anything here.
 |---|---|
 | `game.cpp` | per-frame poll and ambient tick |
 | `actmonster.cpp` | recruitment, friendly fire, NPC engagement |
-| `net.cpp` | seven mod packets, plus the chat bridge for unmodded clients |
+| `net.cpp` | nine mod packets, plus the chat bridge for unmodded clients |
 | `items.cpp` | haggled shop prices, inside `buyValue`/`sellValue` |
 | `shops.cpp` | merchant greeting on shop open |
 | `player.cpp` | the client half of `/friendly` |
-| `files.cpp` | new-run detection, plus a weak stub so the editor still links |
-| `monster_lich.cpp` | applies the Baron's secret weakness |
+| `files.cpp` | tells the mod a level is loading (it decides whether that starts a run), plus a weak stub so the editor still links |
+| `monster_lich.cpp`, `monster_lichfire.cpp`, `monster_lichice.cpp` | apply what a follower told you about the Baron and the Archmagisters |
 | `consolecommand.cpp` | `/aicommand`, `/aiserver`, `/aiidentify`, `/aistatus`, `/ailog` |
 
 ## Building
